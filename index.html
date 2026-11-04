@@ -38,16 +38,17 @@ button:disabled{opacity:.45;cursor:default}
 .bottom div{max-width:728px;margin:0 auto}
 .bottom button{width:100%;min-height:52px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:10px 0}
-.card.suggest{border:2px solid var(--main)}
 .card.warn{background:var(--warn-bg);border-color:#ecd2a2;color:var(--warn)}
 .card h3{margin:0 0 6px;font-size:17px}
-.seq{font-size:14px;overflow-wrap:anywhere}
-.big{font-size:20px;font-weight:700}
 .card ul{margin:8px 0;padding-left:20px}
 .stop{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
 .stop:first-child{border-top:0}
+.stop{gap:6px}
 .idx{flex:none;width:30px;height:30px;border-radius:50%;background:var(--main);color:#fff;display:grid;place-items:center;font-size:14px;font-weight:700}
-.mv{min-width:44px;padding:4px}
+.mv{min-width:40px;padding:4px}
+.drag{flex:none;width:40px;height:44px;display:grid;place-items:center;font-size:24px;line-height:1;color:var(--sub);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
+.dragitem{background:var(--card)}
+.dragging{box-shadow:0 6px 18px #0004;border-radius:8px;position:relative;z-index:3}
 a.primary{display:block;text-align:center;text-decoration:none;padding:13px;border-radius:8px;margin-top:8px}
 dialog{border:0;border-radius:12px;padding:18px;width:min(92vw,480px)}
 dialog::backdrop{background:#0006}
@@ -56,6 +57,7 @@ label.f{display:block;margin:10px 0;font-size:14px;color:var(--sub)}
 .empty{text-align:center;padding:30px 8px;color:var(--sub)}
 body.locked .tabs,body.locked main,body.locked .bottom{display:none}
 #gate{max-width:420px;margin:0 auto;padding:48px 16px}
+body:not(.locked) #gate{display:none}
 #gate h1{font-size:22px;margin:0 0 8px}
 #gate input{font-size:22px;letter-spacing:.15em;text-align:center}
 #gate button{width:100%;margin-top:12px}
@@ -87,14 +89,12 @@ const KEY_V1 = 'yoshikei-route-v1';              // 暗号化前の形式（移�
 const KEY_ENC = 'yoshikei-route-enc-v2';
 const KEY_FAIL = 'yoshikei-route-fails';
 const PBKDF2_ITER = 600000;
-const MIN_SAVE_KM = 0.2, MIN_SAVE_RATE = 0.03;   // これ未満の短縮は提案しない
 const MAX_URL = 2000;                            // Googleの上限2048文字に余裕を持たせる
-const FAR_KM = 60;
 
 const blank = () => ({
   customers: [],
-  settings: { start: '', end: '', sameEnd: true, maxWp: 9, startGeo: null, endGeo: null, autoLockMin: 15 },
-  today: { date: '', checked: [], order: null }
+  settings: { start: '', end: '', sameEnd: true, maxWp: 9, autoLockMin: 15 },
+  today: { date: '', checked: [], order: null, manual: false }
 });
 const withDefaults = d => ({ ...blank(), ...d, settings: { ...blank().settings, ...d.settings } });
 function readV1() {
@@ -146,117 +146,13 @@ function pinProblem(pin) {
   return '';
 }
 const dateStr = () => { const d = new Date(); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; };
-function rollDay() { if (db.today.date !== dateStr()) { db.today = { date: dateStr(), checked: [], order: null }; save(); } }
+function rollDay() { if (db.today.date !== dateStr()) { db.today = { date: dateStr(), checked: [], order: null, manual: false }; save(); } }
 
 const h = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const label = c => `No.${c.no}${c.name ? ' ' + c.name : ''}`;
-const km = v => v.toFixed(1) + 'km';
+const label = c => c.name || c.address;
 
-/* ========== 距離と順番の計算 ========== */
 const hasPos = p => p && Number.isFinite(p.lat) && Number.isFinite(p.lng);
-function dist(a, b) {
-  const R = 6371, r = Math.PI / 180, dLat = (b.lat - a.lat) * r, dLng = (b.lng - a.lng) * r;
-  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(x));
-}
-function routeLen(seq, start, end) {
-  let t = 0;
-  if (seq.length && start) t += dist(start, seq[0]);
-  for (let i = 1; i < seq.length; i++) t += dist(seq[i - 1], seq[i]);
-  if (seq.length && end) t += dist(seq[seq.length - 1], end);
-  return t;
-}
-function nearestFirst(seq, start) {
-  const rest = seq.slice(), out = [];
-  let cur = start || rest.shift();
-  if (!start) out.push(cur);
-  while (rest.length) {
-    let bi = 0, bd = Infinity;
-    rest.forEach((p, i) => { const d = dist(cur, p); if (d < bd) { bd = d; bi = i; } });
-    cur = rest.splice(bi, 1)[0]; out.push(cur);
-  }
-  return out;
-}
-function improve(seq, start, end) {           // 区間反転と移動を、縮まなくなるまで繰り返す
-  let best = seq.slice(), bestLen = routeLen(best, start, end);
-  const n = best.length;
-  for (let loop = 0, changed = true; changed && loop < 100; loop++) {
-    changed = false;
-    for (let i = 0; i < n - 1; i++) for (let j = i + 1; j < n; j++) {
-      const t = [...best.slice(0, i), ...best.slice(i, j + 1).reverse(), ...best.slice(j + 1)];
-      const l = routeLen(t, start, end);
-      if (l < bestLen - 1e-9) { best = t; bestLen = l; changed = true; }
-    }
-    for (let size = 1; size <= 3; size++) for (let i = 0; i + size <= n; i++) {
-      const block = best.slice(i, i + size), others = [...best.slice(0, i), ...best.slice(i + size)];
-      for (let k = 0; k <= others.length; k++) {
-        if (k === i) continue;
-        const t = [...others.slice(0, k), ...block, ...others.slice(k)];
-        const l = routeLen(t, start, end);
-        if (l < bestLen - 1e-9) { best = t; bestLen = l; changed = true; break; }
-      }
-      if (changed) break;
-    }
-  }
-  return best;
-}
-function optimize(seq, start, end) {
-  if (seq.length < 3 && !(seq.length === 2 && (start || end))) return seq.slice();
-  const seeds = [seq, nearestFirst(seq, start), seq.slice().reverse()];
-  return seeds.map(s => improve(s, start, end))
-    .reduce((a, b) => routeLen(b, start, end) < routeLen(a, start, end) - 1e-9 ? b : a);
-}
-function neighbors(seq, i, start, end) {
-  return [i ? seq[i - 1] : start, i < seq.length - 1 ? seq[i + 1] : end];
-}
-function detourOf(prev, x, next) {
-  if (prev && next) return dist(prev, x) + dist(x, next) - dist(prev, next);
-  return prev ? dist(prev, x) : next ? dist(x, next) : 0;
-}
-function ptName(p, start, end) {
-  if (!p) return '';
-  if (p === start) return '出発地';
-  if (p === end) return '帰着地';
-  return `No.${p.no}`;
-}
-function explain(base, prop, start, end) {         // 提案の理由を文章にする
-  const out = [], same = (a, b) => a === b;
-  if (base.length > 2 && base.every((c, i) => same(c, prop[prop.length - 1 - i]))) {
-    out.push('同じ道筋を逆回りにする提案です。出発地・帰着地への距離の関係で短くなります。');
-  }
-  const edge = (seq, s, e) => {
-    const pts = [...(s ? [s] : []), ...seq, ...(e ? [e] : [])], list = [];
-    for (let i = 1; i < pts.length; i++) list.push([pts[i - 1], pts[i], dist(pts[i - 1], pts[i])]);
-    return list;
-  };
-  const propEdges = edge(prop, start, end);
-  const kept = ([a, b]) => propEdges.some(([x, y]) => (x === a && y === b) || (x === b && y === a));
-  const longest = edge(base, start, end).filter(e => !kept(e)).sort((a, b) => b[2] - a[2])[0];
-  if (longest) out.push(`いつもの順にある長い移動「${ptName(longest[0], start, end)}→${ptName(longest[1], start, end)}」（約${km(longest[2])}）がなくなります。`);
-
-  const gains = base.map((c, i) => {
-    const [bp, bn] = neighbors(base, i, start, end), j = prop.indexOf(c), [pp, pn] = neighbors(prop, j, start, end);
-    const unchanged = (bp === pp && bn === pn) || (bp === pn && bn === pp);
-    const before = detourOf(bp, c, bn), after = detourOf(pp, c, pn);
-    return { c, bp, bn, pp, pn, before, after, gain: before - after, unchanged };
-  }).filter(g => !g.unchanged && g.gain >= 0.1).sort((a, b) => b.gain - a.gain).slice(0, 3);
-  gains.forEach(g => {
-    const nearName = [g.pp, g.pn].filter(Boolean)
-      .sort((a, b) => dist(g.c, a) - dist(g.c, b))[0];
-    const near = nearName ? `${ptName(nearName, start, end)}に近い（約${km(dist(g.c, nearName))}）ので、` : '';
-    const place = g.pp === start && start ? '出発してすぐに' : g.pn === end && end ? '帰る前に'
-      : !g.pp ? '最初に' : !g.pn ? '最後に' : `${ptName(g.pp, start, end)}と${ptName(g.pn, start, end)}の間に`;
-    out.push(`${label(g.c)}：${near}${place}回します。`);
-  });
-  return out;
-}
-function propose(base, start, end) {               // 短くなる順番があれば提案を返す
-  const prop = optimize(base, start, end);
-  const a = routeLen(base, start, end), b = routeLen(prop, start, end), saved = a - b;
-  if (saved < MIN_SAVE_KM || saved / a < MIN_SAVE_RATE) return null;
-  return { order: prop, baseLen: a, propLen: b, saved, reasons: explain(base, prop, start, end) };
-}
 
 /* ========== Googleマップのリンク ========== */
 function mapUrl(origin, dest, ways) {
@@ -279,8 +175,7 @@ function buildLinks(addresses, start, end, maxWp) {  // 上限を超えないよ
   return links;
 }
 
-/* ========== 住所→候補・位置（国土地理院の住所検索。送るのは住所のみ） ========== */
-const GEO_V = 2;                                  // 大まかな一致を位置として使わない判定の版
+/* ========== 住所の候補（国土地理院の住所検索。送るのは住所のみ） ========== */
 const KAN = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
 function kanToNum(k) {
   let total = 0, cur = 0;
@@ -350,13 +245,8 @@ async function candidates(input) {                // 県名や郡名を外した
     .map(r => ({ ...r, address: composeAddress(input, r.title) }))
     .filter(r => !seen.has(r.address) && seen.add(r.address)).slice(0, 5);
 }
-async function geocode(address) {
-  const list = await candidates(address);
-  return list.length ? list[0] : null;
-}
 const addressKey = s => fold(normNums(s)).replace(/[\s\-丁目番地号の]/g, '');
 const mapSearchUrl = a => 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(a);
-const needsGeo = c => !c.manualPos && (c.geoFor !== c.address || c.geoV !== GEO_V);
 function attachSuggest(input, box, onPick) {      // 入力中に正式な住所の候補を出す
   let timer, seq = 0, list = [];
   const link = () => input.value.trim() ? `<a href="${h(mapSearchUrl(input.value.trim()))}" target="_blank" rel="noopener noreferrer">この住所をGoogleマップで確認</a>` : '';
@@ -385,30 +275,6 @@ function attachSuggest(input, box, onPick) {      // 入力中に正式な住所
   draw();
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function ensurePositions(list, onStep) {
-  let netErr = false, done = 0;
-  const todo = list.filter(needsGeo);
-  for (const c of todo) {
-    if (onStep(++done, todo.length) === false) return false;
-    try {
-      const g = await geocode(c.address);
-      c.lat = g ? g.lat : null; c.lng = g ? g.lng : null; c.geoTitle = g ? g.title : ''; c.geoFor = c.address; c.geoV = GEO_V;
-      save();
-    } catch (e) { netErr = true; break; }
-    await sleep(120);
-  }
-  return !netErr;
-}
-async function placeGeo(key, address) {
-  const s = db.settings;
-  if (!address) { s[key] = null; return null; }
-  if (s[key] && s[key].for === address && s[key].v === GEO_V) return hasPos(s[key]) ? s[key] : null;
-  const g = await geocode(address);
-  s[key] = { for: address, v: GEO_V, lat: g ? g.lat : null, lng: g ? g.lng : null };
-  save();
-  return g ? s[key] : null;
-}
-
 /* ========== CSV ========== */
 function parseCsv(text) {
   const rows = []; let row = [], cell = '', q = false;
@@ -426,17 +292,23 @@ function parseCsv(text) {
 }
 function toCustomers(rows) {
   if (!rows.length) return [];
-  let col = rows[0].length >= 3 ? { no: 0, name: 1, address: 2, lat: 3, lng: 4, manual: 5 } : { no: 0, name: -1, address: 1, lat: -1, lng: -1, manual: -1 };
-  const head = rows[0].map(c => c.replace(/^﻿/, ''));
+  const width = rows[0].length;
+  let col = width >= 3 ? { no: 0, name: 1, address: 2, lat: 3, lng: 4, manual: 5 }
+    : width === 2 ? { no: 0, name: -1, address: 1, lat: -1, lng: -1, manual: -1 }
+      : { no: -1, name: -1, address: 0, lat: -1, lng: -1, manual: -1 };
+  const head = rows[0].map(c => c.replace(/^\uFEFF/, ''));
   if (head.some(c => c.includes('住所'))) {
     const f = re => head.findIndex(c => re.test(c));
-    col = { no: f(/番号|No/i), name: f(/名前|氏名/), address: f(/住所/), lat: f(/緯度/), lng: f(/経度/), manual: f(/位置指定/) };
+    col = { no: f(/番号|順番|No/i), name: f(/名前|氏名/), address: f(/住所/), lat: f(/緯度/), lng: f(/経度/), manual: f(/位置指定/) };
     rows = rows.slice(1);
   }
-  return rows.map((r, i) => {
-    const address = r[col.address] || '', lat = parseFloat(r[col.lat]), lng = parseFloat(r[col.lng]), ok = Number.isFinite(lat) && Number.isFinite(lng);
-    return { id: uid() + i, no: r[col.no] || String(i + 1), name: col.name >= 0 ? (r[col.name] || '') : '', address, lat: ok ? lat : null, lng: ok ? lng : null, geoFor: ok ? address : null, geoV: ok ? GEO_V : null, manualPos: ok && r[col.manual] === '1', geoTitle: '' };
+  const list = rows.map((r, i) => {
+    const lat = parseFloat(r[col.lat]), lng = parseFloat(r[col.lng]), manual = r[col.manual] === '1' && Number.isFinite(lat) && Number.isFinite(lng);
+    return { id: uid() + i, name: col.name >= 0 ? (r[col.name] || '') : '', address: r[col.address] || '', lat: manual ? lat : null, lng: manual ? lng : null, manualPos: manual, rank: parseInt(z2h(r[col.no] ?? ''), 10) };
   }).filter(c => c.address);
+  if (list.every(c => Number.isFinite(c.rank))) list.sort((a, b) => a.rank - b.rank);   // 順番の列があればその順に並べる
+  list.forEach(c => delete c.rank);
+  return list;
 }
 function decodeFile(buf) {
   try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
@@ -445,7 +317,7 @@ function decodeFile(buf) {
 function exportCsv() {
   if (!confirm('CSVファイルは暗号化されず、名前と住所をそのまま読めます。保存しますか？\n保存先は安全な場所1か所にし、不要になったファイルは消してください。')) return;
   const q = v => /[",\n]/.test(String(v ?? '')) ? `"${String(v).replace(/"/g, '""')}"` : (v ?? '');
-  const lines = [['番号', '名前', '住所', '緯度', '経度', '位置指定'], ...db.customers.map(c => [c.no, c.name, c.address, c.lat, c.lng, c.manualPos ? 1 : ''])].map(r => r.map(q).join(','));
+  const lines = [['順番', '名前', '住所', '緯度', '経度', '位置指定'], ...db.customers.map((c, i) => c.manualPos ? [i + 1, c.name, c.address, c.lat, c.lng, 1] : [i + 1, c.name, c.address, '', '', ''])].map(r => r.map(q).join(','));
   const url = URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' }));
   const a = Object.assign(document.createElement('a'), { href: url, download: `顧客リスト_${dateStr()}.csv` });
   a.click(); URL.revokeObjectURL(url);
@@ -453,7 +325,7 @@ function exportCsv() {
 
 /* ========== 画面 ========== */
 const view = document.getElementById('view'), bottom = document.getElementById('bottom'), makeBtn = document.getElementById('makeRoute');
-let tab = 'check', query = '', onlyChecked = false, routeState = null, busy = '';
+let tab = 'check', query = '', onlyChecked = false;
 
 function show(t) { tab = t; render(); window.scrollTo(0, 0); }
 function render() {
@@ -466,14 +338,14 @@ function render() {
 function updateBottom() {
   const n = db.today.checked.length;
   bottom.hidden = tab !== 'check' || !db.customers.length;
-  makeBtn.textContent = `ルートを作る（${n}件）`;
+  makeBtn.textContent = `ルートを見る（${n}件）`;
   makeBtn.disabled = !n;
 }
 
 function renderCheck() {
   if (!db.customers.length) { view.innerHTML = `<div class="empty">顧客が登録されていません。<br><button class="primary" data-go="list">顧客リストを登録する</button></div>`; return; }
   view.innerHTML = `
-    <div class="row-line"><input type="search" id="q" placeholder="番号・名前・住所で絞り込み" value="${h(query)}"></div>
+    <div class="row-line"><input type="search" id="q" placeholder="順番・名前・住所で絞り込み" value="${h(query)}"></div>
     <div class="row-line">
       <label class="muted"><input type="checkbox" id="only" ${onlyChecked ? 'checked' : ''}> チェック済みだけ表示</label>
       <span class="grow"></span><button id="clear">全部外す</button>
@@ -484,116 +356,83 @@ function renderCheck() {
   document.getElementById('only').onchange = e => { onlyChecked = e.target.checked; drawRows(); };
   document.getElementById('clear').onclick = () => { if (confirm('今日のチェックをすべて外しますか？')) { setChecked([]); drawRows(); updateBottom(); } };
 }
-function setChecked(ids) { db.today.checked = ids; db.today.order = null; routeState = null; save(); }
+function setChecked(ids) { db.today.checked = ids; save(); }
 function drawRows() {
   const q = query.trim().toLowerCase(), ck = new Set(db.today.checked);
-  const rows = db.customers.filter(c => (!onlyChecked || ck.has(c.id)) && (!q || `${c.no} ${c.name} ${c.address}`.toLowerCase().includes(q)));
+  const pos = new Map(db.customers.map((c, i) => [c.id, i + 1]));
+  const rows = db.customers.filter(c => (!onlyChecked || ck.has(c.id)) && (!q || `${pos.get(c.id)} ${c.name} ${c.address}`.toLowerCase().includes(q)));
   document.getElementById('rows').innerHTML = rows.map(c => `
     <label class="cust ${ck.has(c.id) ? 'on' : ''}">
       <input type="checkbox" data-ck="${h(c.id)}" ${ck.has(c.id) ? 'checked' : ''}>
-      <span class="no">${h(c.no)}</span>
+      <span class="no">${pos.get(c.id)}</span>
       <span class="grow">${c.name ? h(c.name) + '<br>' : ''}<span class="addr">${h(c.address)}</span></span>
     </label>`).join('') || '<div class="empty">該当なし</div>';
 }
 
-async function makeRoute() {
-  const sess = lockSession;
-  busy = '位置を確認しています…'; show('route');
-  const ck = new Set(db.today.checked), stops = db.customers.filter(c => ck.has(c.id));
-  const s = db.settings, end = s.sameEnd ? s.start : s.end;
-  const ok = await ensurePositions(stops, (i, n) => {
-    if (sess !== lockSession) return false;
-    busy = `住所の位置を確認中（${i}/${n}）…`; renderRoute();
-  });
-  let startP = null, endP = null, netErr = !ok;
-  if (sess === lockSession) try { startP = await placeGeo('startGeo', s.start); endP = await placeGeo('endGeo', end); } catch (e) { netErr = true; }
-  if (sess !== lockSession) return;
-  busy = '';
-  const located = stops.filter(hasPos), lost = stops.filter(c => !hasPos(c));
-  const proposal = located.length >= 2 ? propose(located, s.start ? startP : null, end ? endP : null) : null;
-  const saved = db.today.order && db.today.order.length === stops.length && db.today.order.every(id => ck.has(id)) ? db.today.order : null;
-  routeState = { baseIds: stops.map(c => c.id), proposal: proposal && { ...proposal, order: [...proposal.order, ...lost].map(c => c.id) }, lostIds: lost.map(c => c.id), netErr, startMissing: !!s.start && !startP, startP, endP };
-  if (!saved) db.today.order = routeState.baseIds.slice();
-  save(); render();
-}
 const byId = id => db.customers.find(c => c.id === id);
-const sameOrder = (a, b) => a && b && a.length === b.length && a.every((v, i) => v === b[i]);
-const seqText = ids => ids.map(id => byId(id)?.no).join(' → ');
-
+function baseIds() {                              // チェックした人をリストの順に並べたもの
+  const ck = new Set(db.today.checked);
+  return db.customers.filter(c => ck.has(c.id)).map(c => c.id);
+}
+function routeIds() {                             // 入れ替えた順番を保ったまま、追加分をリスト順の位置に差し込む
+  const base = baseIds();
+  if (!db.today.manual || !db.today.order) return base;
+  const ck = new Set(base), ids = db.today.order.filter(id => ck.has(id));
+  base.forEach((id, i) => { if (!ids.includes(id)) ids.splice(i ? ids.indexOf(base[i - 1]) + 1 : 0, 0, id); });
+  return ids;
+}
+function setRoute(ids) {
+  const base = baseIds(), same = ids.every((id, i) => id === base[i]);
+  db.today.order = same ? null : ids; db.today.manual = !same;
+  save(); renderRoute();
+}
 function renderRoute() {
-  if (busy) { view.innerHTML = `<div class="empty">${h(busy)}</div>`; return; }
-  const st = routeState, order = db.today.order;
-  if (!st && order && order.length) { makeRoute(); return; }   // 再読み込みやロック解除の後は今日のルートを復元
-  if (!st || !order || !order.length) {
-    view.innerHTML = `<div class="empty">配達チェックで今日のお客様を選び、「ルートを作る」を押してください。<br><br><button class="primary" data-go="check">配達チェックへ</button></div>`;
+  const stops = routeIds().map(byId).filter(Boolean), s = db.settings, end = s.sameEnd ? s.start : s.end;
+  if (!stops.length) {
+    view.innerHTML = `<div class="empty">チェック画面で今日のお客様を選んでください。<br><br><button class="primary" data-go="check">チェックへ</button></div>`;
     return;
   }
-  const stops = order.map(byId).filter(Boolean), s = db.settings, end = s.sameEnd ? s.start : s.end;
-  const startP = s.start ? st.startP : null, endP = end ? st.endP : null;
-  const isBase = sameOrder(order, st.baseIds), p = st.proposal, isProp = p && sameOrder(order, p.order);
   const links = buildLinks(stops.map(c => c.manualPos && hasPos(c) ? `${c.lat},${c.lng}` : c.address), s.start, end, s.maxWp);
-  const located = stops.filter(hasPos);
-  let warnings = '';
-  if (st.netErr) warnings += `<div class="card warn">通信できず、位置を確認できなかった住所があります。電波の良い場所で作り直すと提案が出ます。<br><button data-act="rebuild">作り直す</button></div>`;
-  if (!s.start) warnings += `<div class="card warn">出発地が未設定です。地図は現在地から始まり、提案の精度も下がります。<button data-go="set">設定する</button></div>`;
-  if (st.startMissing) warnings += `<div class="card warn">出発地の住所の位置が取得できませんでした。設定を確認してください。</div>`;
-  if (st.lostIds.length) warnings += `<div class="card warn"><b>位置が分からない住所：</b>${st.lostIds.map(id => h(label(byId(id)))).join('、')}<br>提案では最後に回しています。顧客リストで住所か緯度経度を直してください。</div>`;
-  const far = farOnes(located, startP);
-  if (far.length) warnings += `<div class="card warn"><b>位置が離れすぎています（住所の確認を）：</b>${far.map(c => h(label(c))).join('、')}</div>`;
-
-  let suggest = '';
-  if (p && !isProp) {
-    suggest = `<div class="card suggest"><h3>もっと短い順番があります</h3>
-      <div class="big">約${km(p.saved)} 短縮 <span class="muted">${km(p.baseLen)} → ${km(p.propLen)}（直線距離の目安）</span></div>
-      <p class="seq"><b>いつもの順：</b>${h(seqText(st.baseIds))}<br><b>提案：</b>${h(seqText(p.order))}</p>
-      <ul>${p.reasons.map(r => `<li>${h(r)}</li>`).join('')}</ul>
-      <p class="muted">一方通行・川・時間指定は考慮していません。事情があればいつもの順のままで大丈夫です。</p>
-      <button class="primary" data-act="useProp">提案の順番にする</button></div>`;
-  } else if (isProp) {
-    suggest = `<div class="card"><b>提案の順番を使用中</b>（いつもの順より約${km(p.saved)}短い目安）<div class="row-line"><button data-act="useBase">いつもの順に戻す</button></div></div>`;
-  } else if (isBase && !st.netErr && !st.lostIds.length && !st.startMissing && located.length >= 2) {
-    suggest = `<div class="card">いつもの順で問題ありません。これより明らかに短い順番は見つかりませんでした。</div>`;
-  } else if (!isBase) {
-    suggest = `<div class="card"><b>手動で並べ替えた順番です</b><div class="row-line"><button data-act="useBase">いつもの順に戻す</button></div></div>`;
-  }
-
-  view.innerHTML = `${warnings}${suggest}
-    <h2>今日のルート（${stops.length}件・${km(routeLen(located, startP, endP))}目安）</h2>
+  view.innerHTML = `
+    ${s.start ? '' : '<div class="card warn">出発地が未設定なので、地図は現在地から始まります。<button data-go="set">設定する</button></div>'}
+    <h2>今日のルート（${stops.length}件）</h2>
     <div class="card">${links.map((l, i) => `
       <a class="primary" href="${h(l.url)}" target="_blank" rel="noopener noreferrer">${links.length > 1 ? `区間${i + 1}：` : ''}${l.homeOnly ? '帰着地まで' : `${l.from}〜${l.to}軒目`}をGoogleマップで開く</a>`).join('')}
       ${links.length > 1 ? `<p class="muted">Googleマップの上限のため${links.length}区間に分かれています。区間を走り終えたら次のボタンを押してください。</p>` : ''}
     </div>
-    <div class="card">${stops.map((c, i) => `
-      <div class="stop">
+    ${db.today.manual ? '<div class="card"><b>今日だけ順番を入れ替え中</b><div class="row-line"><button data-act="useBase">いつもの順に戻す</button></div></div>' : ''}
+    <p class="muted">≡ を押したまま上下に動かすと、順番を入れ替えられます。</p>
+    <div class="card" id="stopRows" data-list="route">${stops.map((c, i) => `
+      <div class="stop dragitem">
+        <span class="drag" aria-label="ドラッグして移動">≡</span>
         <span class="idx">${i + 1}</span>
-        <span class="grow"><b>${h(label(c))}</b><br><span class="addr">${h(c.address)}</span></span>
+        <span class="grow"><b>${h(label(c))}</b>${c.name ? `<br><span class="addr">${h(c.address)}</span>` : ''}</span>
         <button class="mv" data-up="${i}" ${i ? '' : 'disabled'} aria-label="上へ">↑</button>
         <button class="mv" data-down="${i}" ${i < stops.length - 1 ? '' : 'disabled'} aria-label="下へ">↓</button>
       </div>`).join('')}</div>`;
 }
-function farOnes(list, start) {
-  if (!list.length) return [];
-  const mid = a => a.slice().sort((x, y) => x - y)[a.length >> 1];
-  const base = start || { lat: mid(list.map(c => c.lat)), lng: mid(list.map(c => c.lng)) };
-  return list.filter(c => dist(base, c) > FAR_KM);
+function moved(list, from, to) {
+  const out = list.slice(), [x] = out.splice(from, 1);
+  out.splice(to, 0, x);
+  return out;
 }
-function moveStop(i, d) {
-  const o = db.today.order, j = i + d;
-  [o[i], o[j]] = [o[j], o[i]];
-  save(); renderRoute();
+function moveStop(i, d) { setRoute(moved(routeIds(), i, i + d)); }
+function applyDrag(list, from, to) {
+  if (list === 'route') setRoute(moved(routeIds(), from, to));
+  else { db.customers = moved(db.customers, from, to); save(); renderList(); }
 }
-
 function renderList() {
   view.innerHTML = `
-    <p class="muted">上から順が「いつもの順」です。チェックした人だけを残した順番が毎日の基本ルートになります。</p>
+    <p class="muted">上から順が「いつもの順」です。≡ を押したまま動かすか、番号を書き換えると並べ替えられます。</p>
     <div class="row-line"><button class="primary" data-act="add">＋ 顧客を追加</button><button data-act="import">まとめて登録</button><button data-act="checkAll" ${db.customers.length && !checking ? '' : 'disabled'}>${checking ? h(checking) : '住所を確認'}</button><button data-act="export" ${db.customers.length ? '' : 'disabled'}>CSVに保存</button></div>
     ${issuesHtml()}
-    ${db.customers.map((c, i) => `
-      <div class="cust" style="cursor:default">
+    <div id="custRows" data-list="customers">${db.customers.map((c, i) => `
+      <div class="cust dragitem" style="cursor:default">
+        <span class="drag" aria-label="ドラッグして移動">≡</span>
         <input class="pos" type="number" min="1" max="${db.customers.length}" value="${i + 1}" data-pos="${i}" aria-label="順番">
-        <span class="grow"><b>${h(label(c))}</b><br><span class="addr">${h(c.address)}</span></span>
+        <span class="grow"><b>${h(label(c))}</b>${c.name ? `<br><span class="addr">${h(c.address)}</span>` : ''}</span>
         <button data-edit="${h(c.id)}">編集</button>
-      </div>`).join('') || '<div class="empty">まだ登録がありません</div>'}`;
+      </div>`).join('') || '<div class="empty">まだ登録がありません</div>'}</div>`;
 }
 let checking = '', issues = null;
 function issuesHtml() {
@@ -620,36 +459,42 @@ async function checkAll() {                       // 全員の住所を調べ、
     const c = list[i];
     try {
       const best = (await candidates(c.address))[0] || null;
-      c.lat = best ? best.lat : null; c.lng = best ? best.lng : null; c.geoTitle = best ? best.title : ''; c.geoFor = c.address; c.geoV = GEO_V;
       if (!best || addressKey(best.address) !== addressKey(c.address)) found.push({ id: c.id, best });
-      save();
     } catch (e) { checking = ''; issues = found; renderList(); alert('通信できず、途中で止まりました。電波の良い場所でもう一度押してください。'); return; }
     await sleep(120);
   }
-  checking = ''; issues = found; routeState = null;
+  checking = ''; issues = found;
   if (tab === 'list') renderList();
 }
 function fixAddress(id) {
   const x = issues.find(i => i.id === id), c = byId(id);
   if (!x || !x.best || !c) return;
-  Object.assign(c, { address: x.best.address, lat: x.best.lat, lng: x.best.lng, geoTitle: x.best.title, geoFor: x.best.address, geoV: GEO_V, manualPos: false });
+  c.address = x.best.address;
   issues = issues.filter(i => i.id !== id);
-  routeState = null; save(); renderList();
+  save(); renderList();
 }
 function editDialog(c) {
-  const isNew = !c; c = c || { id: uid(), no: String(db.customers.length + 1), name: '', address: '' };
+  const isNew = !c; c = c || { id: uid(), name: '', address: '' };
+  const others = db.customers.filter(x => x !== c), myIndex = db.customers.indexOf(c);
+  const afterId = isNew ? (others.length ? others[others.length - 1].id : '') : (myIndex > 0 ? db.customers[myIndex - 1].id : '');
   const coords = hasPos(c) ? `${c.lat}, ${c.lng}` : '';
   dlgForm.innerHTML = `
     <h3 style="margin:0">${isNew ? '顧客を追加' : '顧客を編集'}</h3>
-    <label class="f">番号<input type="text" id="fNo" value="${h(c.no)}"></label>
     <label class="f">名前（省略可）<input type="text" id="fName" value="${h(c.name)}"></label>
     <label class="f">住所<input type="text" id="fAddr" value="${h(c.address)}" autocomplete="off" placeholder="例：大阪府大阪市北区中之島1-3-20"></label>
     <div class="sg" id="fAddrBox"></div>
+    <label class="f">配達の順番（選んだ人の次に入ります）
+      <select id="fAfter"><option value="">一番最初</option>${others.map((x, i) => `<option value="${h(x.id)}" ${x.id === afterId ? 'selected' : ''}>${i + 1}. ${h(label(x))} の次</option>`).join('')}</select></label>
+    <p class="muted" id="fBetween"></p>
     <label class="f">緯度, 経度（Googleマップで住所が出ないときだけ。地点を長押しすると表示されます。入れると地図はこの地点を案内します）
       <input type="text" id="fPos" value="${h(c.manualPos ? coords : '')}" placeholder="例: 34.6938, 135.5012"></label>
-    ${c.geoTitle ? `<p class="muted">位置の検索結果：${h(c.geoTitle)}</p>` : ''}
     <div class="row-line"><button class="primary" value="ok">保存</button><button value="cancel" formnovalidate>やめる</button>${isNew ? '' : '<button class="danger" value="del">削除</button>'}</div>`;
   attachSuggest(fAddr, fAddrBox);
+  const showBetween = () => {
+    const i = others.findIndex(x => x.id === fAfter.value), a = others[i], b = others[i + 1];
+    fBetween.textContent = !others.length ? '' : a && b ? `→ ${label(a)} と ${label(b)} の間` : a ? `→ ${label(a)} の次（一番最後）` : `→ ${label(others[0])} の前（一番最初）`;
+  };
+  fAfter.onchange = showBetween; showBetween();
   dlg.returnValue = '';
   dlg.onclose = () => {
     if (dlg.returnValue === 'del') {
@@ -660,17 +505,14 @@ function editDialog(c) {
       const address = fAddr.value.trim();
       if (!address) { alert('住所を入力してください'); return; }
       const m = fPos.value.match(/(-?\d+(?:\.\d+)?)\s*[,、\s]\s*(-?\d+(?:\.\d+)?)/);
-      const posText = fPos.value.trim(), posEdited = posText !== (c.manualPos ? coords : ''), changed = address !== c.address;
+      const posText = fPos.value.trim();
       if (posText && !m) { alert('緯度, 経度の形式が読み取れないため、位置は保存しませんでした'); }
-      Object.assign(c, { no: fNo.value.trim() || c.no, name: fName.value.trim(), address });
-      if (m && (posEdited || c.manualPos)) {
-        Object.assign(c, { lat: +m[1], lng: +m[2], geoFor: address, geoV: GEO_V, geoTitle: '手入力', manualPos: true });
-      } else if (changed || c.manualPos) {
-        Object.assign(c, { lat: null, lng: null, geoFor: null, geoV: null, geoTitle: '', manualPos: false });
-      }
-      if (isNew) db.customers.push(c);
+      Object.assign(c, { name: fName.value.trim(), address });
+      Object.assign(c, m ? { lat: +m[1], lng: +m[2], manualPos: true } : { lat: null, lng: null, manualPos: false });
+      const rest = others.slice(), at = fAfter.value ? rest.findIndex(x => x.id === fAfter.value) + 1 : 0;
+      rest.splice(at, 0, c);
+      db.customers = rest;
       if (issues) issues = issues.filter(i => i.id !== c.id);
-      routeState = null;
       save();
     } else return;
     render();
@@ -680,7 +522,7 @@ function editDialog(c) {
 function importDialog() {
   dlgForm.innerHTML = `
     <h3 style="margin:0">まとめて登録</h3>
-    <p class="muted">Excelからの貼り付けか、CSVファイルで登録できます。行の順番が「いつもの順」になります。<br>列：番号, 名前, 住所（名前なしの「番号, 住所」でも可）</p>
+    <p class="muted">Excelからの貼り付けか、CSVファイルで登録できます。順番の列があればその順に、なければ行の順に並びます。<br>列：順番, 名前, 住所（「順番, 住所」や住所だけでも可）</p>
     <textarea id="fCsv" rows="8" placeholder="1,山田,大阪府大阪市…&#10;2,佐藤,大阪府大阪市…"></textarea>
     <div class="row-line"><input type="file" id="fFile" accept=".csv,.txt,text/csv"></div>
     <p class="muted" style="color:var(--bad)">今の顧客リストは置き換えられ、今日のチェックも外れます。</p>
@@ -718,12 +560,12 @@ function renderSet() {
     <h2>個人情報の扱い</h2>
     <div class="card muted">
       顧客データと設定は、この端末のブラウザ内にPINで暗号化して保存されます。<br>
-      住所は位置確認のため国土地理院へ、地図表示のためGoogleへ送られます。名前と番号は送信しません。<br>
+      住所は候補の確認のため国土地理院へ、地図表示のためGoogleへ送られます。名前は送信しません。<br>
       ブラウザのデータを消すとリストも消え、PINを忘れると元に戻せません。顧客画面の「CSVに保存」で控えを1つ、安全な場所に保管してください。
     </div>
     <h2>データ</h2>
     <button class="danger" data-act="wipe">この端末のデータをすべて消す</button>`;
-  const saveS = () => { s.start = sStart.value.trim(); s.sameEnd = sSame.checked; s.end = sEnd.value.trim(); s.maxWp = +sWp.value; s.autoLockMin = +sLock.value; routeState = null; save(); endWrap.hidden = s.sameEnd; };
+  const saveS = () => { s.start = sStart.value.trim(); s.sameEnd = sSame.checked; s.end = sEnd.value.trim(); s.maxWp = +sWp.value; s.autoLockMin = +sLock.value; save(); endWrap.hidden = s.sameEnd; };
   [sStart, sSame, sEnd, sWp, sLock].forEach(el => el.onchange = saveS);
   attachSuggest(sStart, sStartBox, saveS);
   attachSuggest(sEnd, sEndBox, saveS);
@@ -756,8 +598,15 @@ function afterUnlock() {
   gate.innerHTML = '';
   document.body.classList.remove('locked');
   lastActive = Date.now();
+  if (db.customers.some(c => 'no' in c)) {        // 旧版の番号を順番として取り込み、番号欄を廃止
+    const rank = c => { const n = parseInt(z2h(c.no ?? ''), 10); return Number.isFinite(n) ? n : Infinity; };
+    db.customers = db.customers.map((c, i) => ({ c, i })).sort((a, b) => rank(a.c) - rank(b.c) || a.i - b.i).map(x => x.c);
+    db.customers.forEach(c => { delete c.no; delete c.geoFor; delete c.geoV; delete c.geoTitle; if (!c.manualPos) { c.lat = null; c.lng = null; } });
+    db.today.order = null; db.today.manual = false;
+    save();
+  }
   rollDay();
-  tab = db.today.order && db.today.order.length ? 'route' : 'check';
+  tab = db.today.checked.length ? 'route' : 'check';
   render();
 }
 function showGate(mode) {
@@ -817,19 +666,19 @@ function showGate(mode) {
 function lock() {
   if (!cryptoKey) return;
   lockSession++;
-  cryptoKey = null; keyMeta = null; db = blank(); routeState = null; busy = ''; query = ''; issues = null; checking = '';
+  cryptoKey = null; keyMeta = null; db = blank(); query = ''; issues = null; checking = '';
   if (dlg.open) dlg.close('cancel');
   view.innerHTML = '';
   showGate('unlock');
 }
 function wipeAll() {
   lockSession++;
-  cryptoKey = null; keyMeta = null; db = blank(); routeState = null; busy = ''; view.innerHTML = '';
+  cryptoKey = null; keyMeta = null; db = blank(); query = ''; issues = null; checking = ''; view.innerHTML = '';
   [KEY_ENC, KEY_FAIL, KEY_V1].forEach(k => localStorage.removeItem(k));
   showGate('setup');
 }
 function checkIdle() {
-  if (cryptoKey && !busy && Date.now() - lastActive > db.settings.autoLockMin * 60000) lock();
+  if (cryptoKey && Date.now() - lastActive > db.settings.autoLockMin * 60000) lock();
 }
 ['pointerdown', 'keydown', 'scroll'].forEach(ev => addEventListener(ev, () => { lastActive = Date.now(); }, { passive: true }));
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkIdle(); });
@@ -837,7 +686,7 @@ setInterval(checkIdle, 30000);
 
 const dlg = document.getElementById('dlg'), dlgForm = document.getElementById('dlgForm');
 document.getElementById('tabs').onclick = e => { const t = e.target.dataset.tab; if (t) show(t); };
-makeBtn.onclick = makeRoute;
+makeBtn.onclick = () => show('route');
 view.addEventListener('change', e => {
   const t = e.target;
   if (t.dataset.ck) {
@@ -851,7 +700,7 @@ view.addEventListener('change', e => {
   if (t.dataset.pos !== undefined) {
     const from = +t.dataset.pos, to = Math.min(Math.max(+t.value || 1, 1), db.customers.length) - 1;
     const [c] = db.customers.splice(from, 1); db.customers.splice(to, 0, c);
-    routeState = null; db.today.order = null; save(); renderList();
+    save(); renderList();
   }
 });
 view.addEventListener('click', e => {
@@ -866,12 +715,42 @@ view.addEventListener('click', e => {
   if (d.act === 'add') editDialog();
   if (d.act === 'import') importDialog();
   if (d.act === 'export') exportCsv();
-  if (d.act === 'rebuild') makeRoute();
-  if (d.act === 'useProp') { db.today.order = routeState.proposal.order.slice(); save(); renderRoute(); window.scrollTo(0, 0); }
-  if (d.act === 'useBase') { db.today.order = routeState.baseIds.slice(); save(); renderRoute(); }
+  if (d.act === 'useBase') { db.today.order = null; db.today.manual = false; save(); renderRoute(); }
   if (d.act === 'lockNow') lock();
   if (d.act === 'changePin') changePinDialog();
   if (d.act === 'wipe' && confirm('顧客リストと設定をすべて消します。よろしいですか？')) wipeAll();
+});
+view.addEventListener('pointerdown', e => {      // ≡ を押したまま動かして並べ替える
+  const handle = e.target.closest('.drag'); if (!handle) return;
+  e.preventDefault();
+  const item = handle.closest('.dragitem'), box = item.parentElement, from = [...box.children].indexOf(item);
+  let y = e.clientY, done = false;
+  item.classList.add('dragging');
+  view.setPointerCapture(e.pointerId);
+  const place = () => {
+    const before = [...box.children].filter(x => x !== item).find(el => { const r = el.getBoundingClientRect(); return y < r.top + r.height / 2; }) || null;
+    if (item.nextElementSibling !== before) box.insertBefore(item, before);
+    [...box.children].forEach((el, i) => {
+      const n = el.querySelector('.idx'), p = el.querySelector('.pos');
+      if (n) n.textContent = i + 1;
+      if (p) p.value = i + 1;
+    });
+  };
+  const onMove = ev => { if (ev.pointerId === e.pointerId) { y = ev.clientY; place(); } };
+  const scroller = setInterval(() => {
+    const d = y < 80 ? -14 : y > innerHeight - 70 ? 14 : 0;
+    if (d) { window.scrollBy(0, d); place(); }
+  }, 30);
+  const onEnd = ev => {
+    if (done || ev.pointerId !== e.pointerId) return;
+    done = true;
+    clearInterval(scroller);
+    view.removeEventListener('pointermove', onMove); view.removeEventListener('pointerup', onEnd); view.removeEventListener('pointercancel', onEnd);
+    item.classList.remove('dragging');
+    const to = [...box.children].indexOf(item);
+    if (ev.type === 'pointerup' && to !== from) applyDrag(box.dataset.list, from, to); else render();
+  };
+  view.addEventListener('pointermove', onMove); view.addEventListener('pointerup', onEnd); view.addEventListener('pointercancel', onEnd);
 });
 if (!window.crypto || !crypto.subtle) {
   gate.innerHTML = '<div class="empty">この開き方では暗号化が使えません。https:// のURLから開いてください。</div>';
