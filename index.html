@@ -12,7 +12,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,"Hir
 main{max-width:760px;margin:0 auto;padding:12px 16px}
 h2{font-size:18px;margin:18px 0 8px}
 button,input,textarea,select{font:inherit;color:inherit}
-input[type=text],input[type=search],input[type=number],textarea,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+input[type=text],input[type=search],input[type=number],input[type=password],textarea,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
 button{min-height:44px;padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer}
 button.primary,a.primary{background:var(--main);color:var(--main-ink);border-color:var(--main);font-weight:700}
 button.danger{color:var(--bad)}
@@ -129,9 +129,10 @@ async function setPin(pin, data) {
   await save();
 }
 function pinProblem(pin) {
-  if (!/^\d{6,}$/.test(pin)) return '6桁以上の数字にしてください';
+  if (pin.length < 6) return '6文字以上にしてください';
+  if (!/^[\x21-\x7e]+$/.test(pin)) return '使えるのは半角の英字・数字・記号です（空白や日本語は使えません）';
   const asc = '01234567890123456789', desc = '98765432109876543210';
-  if (/^(\d)\1+$/.test(pin) || asc.includes(pin) || desc.includes(pin)) return '同じ数字や連番は使えません';
+  if (/^(.)\1+$/.test(pin) || asc.includes(pin) || desc.includes(pin)) return '同じ文字の繰り返しや連番は使えません';
   return '';
 }
 const dateStr = () => { const d = new Date(); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; };
@@ -570,9 +571,9 @@ function renderSet() {
 function changePinDialog() {
   dlgForm.innerHTML = `
     <h3 style="margin:0">PINを変更</h3>
-    <label class="f">今のPIN<input type="password" inputmode="numeric" autocomplete="off" id="pOld"></label>
-    <label class="f">新しいPIN（6桁以上の数字）<input type="password" inputmode="numeric" autocomplete="off" id="pNew"></label>
-    <label class="f">新しいPIN（確認）<input type="password" inputmode="numeric" autocomplete="off" id="pNew2"></label>
+    <label class="f">今のPIN<input type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" id="pOld"></label>
+    <label class="f">新しいPIN（6文字以上の英字・数字・記号）<input type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" id="pNew"></label>
+    <label class="f">新しいPIN（確認）<input type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" id="pNew2"></label>
     <div class="row-line"><button class="primary" value="ok">変更</button><button value="cancel">やめる</button></div>`;
   dlg.returnValue = '';
   dlg.onclose = async () => {
@@ -604,14 +605,18 @@ function showGate(mode) {
   const setup = mode === 'setup', migrating = setup && !!readV1();
   gate.innerHTML = `<form id="gForm">
     <h1>${setup ? 'PINを決めてください' : '配達ルート'}</h1>
-    <p class="muted">${setup ? `6桁以上の数字にしてください。顧客データはこのPINで暗号化されます。<br><b>PINを忘れるとデータは元に戻せません。</b>${migrating ? '<br>登録済みのデータは暗号化して引き継ぎます。' : ''}` : 'PINを入力してください'}</p>
-    <input type="password" inputmode="numeric" autocomplete="off" id="gPin" aria-label="PIN" autofocus>
-    ${setup ? '<p class="muted">確認のためもう一度</p><input type="password" inputmode="numeric" autocomplete="off" id="gPin2" aria-label="PIN確認">' : ''}
+    <p class="muted">${setup ? `6文字以上で決めてください。英字（大文字・小文字）、数字、記号が使えます。長いほど安全で、8文字以上がおすすめです。顧客データはこのPINで暗号化されます。<br><b>PINを忘れるとデータは元に戻せません。</b>${migrating ? '<br>登録済みのデータは暗号化して引き継ぎます。' : ''}` : 'PINを入力してください'}</p>
+    <input type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" id="gPin" aria-label="PIN" autofocus>
+    ${setup ? '<p class="muted">確認のためもう一度</p><input type="password" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" id="gPin2" aria-label="PIN確認">' : ''}
+    <label class="muted"><input type="checkbox" id="gShow" style="width:auto"> 入力を表示</label>
     <p class="err" id="gErr" role="alert"></p>
     <button class="primary" id="gOk">${setup ? 'このPINで始める' : 'ロック解除'}</button>
     ${setup ? '' : '<button type="button" class="link" id="gForgot">PINを忘れた</button>'}
   </form>`;
   const err = document.getElementById('gErr'), ok = document.getElementById('gOk'), pinEl = document.getElementById('gPin');
+  document.getElementById('gShow').onchange = e => {
+    gate.querySelectorAll('#gPin,#gPin2').forEach(el => { el.type = e.target.checked ? 'text' : 'password'; });
+  };
   document.getElementById('gForm').onsubmit = async e => {
     e.preventDefault();
     err.textContent = '';
