@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>配達ルート</title>
+<style>
+:root{--bg:#f4f5f1;--card:#fff;--ink:#20241f;--sub:#646b60;--line:#dcdfd6;--main:#2e7d4f;--main-ink:#fff;--soft:#e4f1e8;--warn:#9a5b00;--warn-bg:#fdf1dc;--bad:#b3261e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,"Hiragino Sans","Yu Gothic UI",Meiryo,sans-serif;padding-bottom:150px}
+main{max-width:760px;margin:0 auto;padding:12px 16px}
+h2{font-size:18px;margin:18px 0 8px}
+button,input,textarea,select{font:inherit;color:inherit}
+input[type=text],input[type=search],input[type=number],textarea,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+button{min-height:44px;padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer}
+button.primary,a.primary{background:var(--main);color:var(--main-ink);border-color:var(--main);font-weight:700}
+button.danger{color:var(--bad)}
+button:disabled{opacity:.45;cursor:default}
+.tabs{position:sticky;top:0;z-index:5;display:flex;background:var(--card);border-bottom:1px solid var(--line)}
+.tabs button{flex:1;border:0;border-radius:0;border-bottom:3px solid transparent;background:none;color:var(--sub)}
+.tabs button.on{border-bottom-color:var(--main);color:var(--ink);font-weight:700}
+.row-line{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
+.row-line>input{flex:1;min-width:160px}
+.muted{color:var(--sub);font-size:14px}
+.cust{display:flex;gap:12px;align-items:center;padding:10px 12px;background:var(--card);border:1px solid var(--line);border-radius:8px;margin-bottom:6px;cursor:pointer}
+.cust.on{background:var(--soft);border-color:var(--main)}
+.cust input{width:24px;height:24px;flex:none;accent-color:var(--main)}
+.no{font-weight:700;min-width:2.6em;font-variant-numeric:tabular-nums}
+.addr{font-size:14px;color:var(--sub);overflow-wrap:anywhere}
+.grow{flex:1;min-width:0}
+.bottom{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:10px 16px;z-index:5}
+.bottom div{max-width:728px;margin:0 auto}
+.bottom button{width:100%;min-height:52px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:10px 0}
+.card.suggest{border:2px solid var(--main)}
+.card.warn{background:var(--warn-bg);border-color:#ecd2a2;color:var(--warn)}
+.card h3{margin:0 0 6px;font-size:17px}
+.seq{font-size:14px;overflow-wrap:anywhere}
+.big{font-size:20px;font-weight:700}
+.card ul{margin:8px 0;padding-left:20px}
+.stop{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.stop:first-child{border-top:0}
+.idx{flex:none;width:30px;height:30px;border-radius:50%;background:var(--main);color:#fff;display:grid;place-items:center;font-size:14px;font-weight:700}
+.mv{min-width:44px;padding:4px}
+a.primary{display:block;text-align:center;text-decoration:none;padding:13px;border-radius:8px;margin-top:8px}
+dialog{border:0;border-radius:12px;padding:18px;width:min(92vw,480px)}
+dialog::backdrop{background:#0006}
+label.f{display:block;margin:10px 0;font-size:14px;color:var(--sub)}
+.pos{width:64px!important;flex:none;padding:8px 4px;text-align:center}
+.empty{text-align:center;padding:30px 8px;color:var(--sub)}
+body.locked .tabs,body.locked main,body.locked .bottom{display:none}
+#gate{max-width:420px;margin:0 auto;padding:48px 16px}
+#gate h1{font-size:22px;margin:0 0 8px}
+#gate input{font-size:22px;letter-spacing:.15em;text-align:center}
+#gate button{width:100%;margin-top:12px}
+#gate button.link{border:0;background:none;color:var(--sub);text-decoration:underline}
+.err{color:var(--bad);min-height:1.5em;font-size:14px;margin:8px 0 0}
+</style>
+</head>
+<body class="locked">
+<section id="gate"></section>
+<nav class="tabs" id="tabs">
+  <button data-tab="check">チェック</button>
+  <button data-tab="route">ルート</button>
+  <button data-tab="list">顧客</button>
+  <button data-tab="set">設定</button>
+</nav>
+<main id="view"></main>
+<div class="bottom" id="bottom" hidden><div><button class="primary" id="makeRoute"></button></div></div>
+<dialog id="dlg"><form method="dialog" id="dlgForm"></form></dialog>
+
+<script>
+'use strict';
+/* ========== データ保存（この端末のブラウザ内に、PINで暗号化して保存） ========== */
+const KEY_V1 = 'yoshikei-route-v1';              // 暗号化前の形式（移行のためだけに読む）
+const KEY_ENC = 'yoshikei-route-enc-v2';
+const KEY_FAIL = 'yoshikei-route-fails';
+const PBKDF2_ITER = 600000;
+const MIN_SAVE_KM = 0.2, MIN_SAVE_RATE = 0.03;   // これ未満の短縮は提案しない
+const MAX_URL = 2000;                            // Googleの上限2048文字に余裕を持たせる
+const FAR_KM = 60;
+
+const blank = () => ({
+  customers: [],
+  settings: { start: '', end: '', sameEnd: true, maxWp: 9, startGeo: null, endGeo: null, autoLockMin: 15 },
+  today: { date: '', checked: [], order: null }
+});
+const withDefaults = d => ({ ...blank(), ...d, settings: { ...blank().settings, ...d.settings } });
+function readV1() {
+  try { const d = JSON.parse(localStorage.getItem(KEY_V1)); return d && d.customers ? withDefaults(d) : null; }
+  catch (e) { return null; }
+}
+let db = blank(), cryptoKey = null, keyMeta = null, lockSession = 0, lastActive = Date.now(), saveQueue = Promise.resolve();
+
+const toB64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const fromB64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+async function deriveKey(pin, salt, iter) {
+  const raw = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: iter }, raw,
+    { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function writeRecord(key, meta, json) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(json));
+  localStorage.setItem(KEY_ENC, JSON.stringify({ v: 2, salt: toB64(meta.salt), iter: meta.iter, iv: toB64(iv), ct: toB64(ct) }));
+}
+function readRecord() {
+  try { return JSON.parse(localStorage.getItem(KEY_ENC)); } catch (e) { return null; }
+}
+async function openRecord(pin) {                  // PINが違うとnullを返す
+  const rec = readRecord(), salt = fromB64(rec.salt), key = await deriveKey(pin, salt, rec.iter);
+  try {
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(rec.iv) }, key, fromB64(rec.ct));
+    return { key, meta: { salt, iter: rec.iter }, data: withDefaults(JSON.parse(new TextDecoder().decode(plain))) };
+  } catch (e) { return null; }
+}
+function save() {
+  if (!cryptoKey) return saveQueue;
+  const key = cryptoKey, meta = keyMeta, json = JSON.stringify(db);
+  saveQueue = saveQueue.then(() => writeRecord(key, meta, json)).catch(e => alert('保存できませんでした: ' + e.message));
+  return saveQueue;
+}
+async function setPin(pin, data) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  cryptoKey = await deriveKey(pin, salt, PBKDF2_ITER);
+  keyMeta = { salt, iter: PBKDF2_ITER };
+  db = data;
+  await save();
+}
+function pinProblem(pin) {
+  if (!/^\d{6,}$/.test(pin)) return '6桁以上の数字にしてください';
+  const asc = '01234567890123456789', desc = '98765432109876543210';
+  if (/^(\d)\1+$/.test(pin) || asc.includes(pin) || desc.includes(pin)) return '同じ数字や連番は使えません';
+  return '';
+}
+const dateStr = () => { const d = new Date(); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; };
+function rollDay() { if (db.today.date !== dateStr()) { db.today = { date: dateStr(), checked: [], order: null }; save(); } }
+
+const h = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const label = c => `No.${c.no}${c.name ? ' ' + c.name : ''}`;
+const km = v => v.toFixed(1) + 'km';
+
+/* ========== 距離と順番の計算 ========== */
+const hasPos = p => p && Number.isFinite(p.lat) && Number.isFinite(p.lng);
+function dist(a, b) {
+  const R = 6371, r = Math.PI / 180, dLat = (b.lat - a.lat) * r, dLng = (b.lng - a.lng) * r;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+function routeLen(seq, start, end) {
+  let t = 0;
+  if (seq.length && start) t += dist(start, seq[0]);
+  for (let i = 1; i < seq.length; i++) t += dist(seq[i - 1], seq[i]);
+  if (seq.length && end) t += dist(seq[seq.length - 1], end);
+  return t;
+}
+function nearestFirst(seq, start) {
+  const rest = seq.slice(), out = [];
+  let cur = start || rest.shift();
+  if (!start) out.push(cur);
+  while (rest.length) {
+    let bi = 0, bd = Infinity;
+    rest.forEach((p, i) => { const d = dist(cur, p); if (d < bd) { bd = d; bi = i; } });
+    cur = rest.splice(bi, 1)[0]; out.push(cur);
+  }
+  return out;
+}
+function improve(seq, start, end) {           // 区間反転と移動を、縮まなくなるまで繰り返す
+  let best = seq.slice(), bestLen = routeLen(best, start, end);
+  const n = best.length;
+  for (let loop = 0, changed = true; changed && loop < 100; loop++) {
+    changed = false;
+    for (let i = 0; i < n - 1; i++) for (let j = i + 1; j < n; j++) {
+      const t = [...best.slice(0, i), ...best.slice(i, j + 1).reverse(), ...best.slice(j + 1)];
+      const l = routeLen(t, start, end);
+      if (l < bestLen - 1e-9) { best = t; bestLen = l; changed = true; }
+    }
+    for (let size = 1; size <= 3; size++) for (let i = 0; i + size <= n; i++) {
+      const block = best.slice(i, i + size), others = [...best.slice(0, i), ...best.slice(i + size)];
+      for (let k = 0; k <= others.length; k++) {
+        if (k === i) continue;
+        const t = [...others.slice(0, k), ...block, ...others.slice(k)];
+        const l = routeLen(t, start, end);
+        if (l < bestLen - 1e-9) { best = t; bestLen = l; changed = true; break; }
+      }
+      if (changed) break;
+    }
+  }
+  return best;
+}
+function optimize(seq, start, end) {
+  if (seq.length < 3 && !(seq.length === 2 && (start || end))) return seq.slice();
+  const seeds = [seq, nearestFirst(seq, start), seq.slice().reverse()];
+  return seeds.map(s => improve(s, start, end))
+    .reduce((a, b) => routeLen(b, start, end) < routeLen(a, start, end) - 1e-9 ? b : a);
+}
+function neighbors(seq, i, start, end) {
+  return [i ? seq[i - 1] : start, i < seq.length - 1 ? seq[i + 1] : end];
+}
+function detourOf(prev, x, next) {
+  if (prev && next) return dist(prev, x) + dist(x, next) - dist(prev, next);
+  return prev ? dist(prev, x) : next ? dist(x, next) : 0;
+}
+function ptName(p, start, end) {
+  if (!p) return '';
+  if (p === start) return '出発地';
+  if (p === end) return '帰着地';
+  return `No.${p.no}`;
+}
+function explain(base, prop, start, end) {         // 提案の理由を文章にする
+  const out = [], same = (a, b) => a === b;
+  if (base.length > 2 && base.every((c, i) => same(c, prop[prop.length - 1 - i]))) {
+    out.push('同じ道筋を逆回りにする提案です。出発地・帰着地への距離の関係で短くなります。');
+  }
+  const edge = (seq, s, e) => {
+    const pts = [...(s ? [s] : []), ...seq, ...(e ? [e] : [])], list = [];
+    for (let i = 1; i < pts.length; i++) list.push([pts[i - 1], pts[i], dist(pts[i - 1], pts[i])]);
+    return list;
+  };
+  const propEdges = edge(prop, start, end);
+  const kept = ([a, b]) => propEdges.some(([x, y]) => (x === a && y === b) || (x === b && y === a));
+  const longest = edge(base, start, end).filter(e => !kept(e)).sort((a, b) => b[2] - a[2])[0];
+  if (longest) out.push(`いつもの順にある長い移動「${ptName(longest[0], start, end)}→${ptName(longest[1], start, end)}」（約${km(longest[2])}）がなくなります。`);
+
+  const gains = base.map((c, i) => {
+    const [bp, bn] = neighbors(base, i, start, end), j = prop.indexOf(c), [pp, pn] = neighbors(prop, j, start, end);
+    const unchanged = (bp === pp && bn === pn) || (bp === pn && bn === pp);
+    const before = detourOf(bp, c, bn), after = detourOf(pp, c, pn);
+    return { c, bp, bn, pp, pn, before, after, gain: before - after, unchanged };
+  }).filter(g => !g.unchanged && g.gain >= 0.1).sort((a, b) => b.gain - a.gain).slice(0, 3);
+  gains.forEach(g => {
+    const nearName = [g.pp, g.pn].filter(Boolean)
+      .sort((a, b) => dist(g.c, a) - dist(g.c, b))[0];
+    const near = nearName ? `${ptName(nearName, start, end)}に近い（約${km(dist(g.c, nearName))}）ので、` : '';
+    const place = g.pp === start && start ? '出発してすぐに' : g.pn === end && end ? '帰る前に'
+      : !g.pp ? '最初に' : !g.pn ? '最後に' : `${ptName(g.pp, start, end)}と${ptName(g.pn, start, end)}の間に`;
+    out.push(`${label(g.c)}：${near}${place}回します。`);
+  });
+  return out;
+}
+function propose(base, start, end) {               // 短くなる順番があれば提案を返す
+  const prop = optimize(base, start, end);
+  const a = routeLen(base, start, end), b = routeLen(prop, start, end), saved = a - b;
+  if (saved < MIN_SAVE_KM || saved / a < MIN_SAVE_RATE) return null;
+  return { order: prop, baseLen: a, propLen: b, saved, reasons: explain(base, prop, start, end) };
+}
+
+/* ========== Googleマップのリンク ========== */
+function mapUrl(origin, dest, ways) {
+  let u = 'https://www.google.com/maps/dir/?api=1&travelmode=driving';
+  if (origin) u += '&origin=' + encodeURIComponent(origin);
+  u += '&destination=' + encodeURIComponent(dest);
+  if (ways.length) u += '&waypoints=' + encodeURIComponent(ways.join('|'));
+  return u;
+}
+function buildLinks(addresses, start, end, maxWp) {  // 上限を超えないよう区間に分ける（順番は変えない）
+  const pts = end ? [...addresses, end] : addresses.slice(), links = [];
+  let origin = start || null, i = 0;
+  while (i < pts.length) {
+    let take = Math.min(maxWp + 1, pts.length - i);
+    while (take > 1 && mapUrl(origin, pts[i + take - 1], pts.slice(i, i + take - 1)).length > MAX_URL) take--;
+    const dest = pts[i + take - 1];
+    links.push({ url: mapUrl(origin, dest, pts.slice(i, i + take - 1)), from: i + 1, to: Math.min(i + take, addresses.length), homeOnly: i >= addresses.length });
+    origin = dest; i += take;
+  }
+  return links;
+}
+
+/* ========== 住所→位置（国土地理院の住所検索。送るのは住所のみ） ========== */
+async function geocode(address) {
+  const r = await fetch('https://msearch.gsi.go.jp/address-search/AddressSearch?q=' + encodeURIComponent(address), { referrerPolicy: 'no-referrer' });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const j = await r.json();
+  if (!j.length) return null;
+  const [lng, lat] = j[0].geometry.coordinates;
+  return { lat, lng, title: j[0].properties.title };
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function ensurePositions(list, onStep) {
+  let netErr = false, done = 0;
+  const todo = list.filter(c => c.geoFor !== c.address);
+  for (const c of todo) {
+    if (onStep(++done, todo.length) === false) return false;
+    try {
+      const g = await geocode(c.address);
+      c.lat = g ? g.lat : null; c.lng = g ? g.lng : null; c.geoTitle = g ? g.title : ''; c.geoFor = c.address;
+      save();
+    } catch (e) { netErr = true; break; }
+    await sleep(120);
+  }
+  return !netErr;
+}
+async function placeGeo(key, address) {
+  const s = db.settings;
+  if (!address) { s[key] = null; return null; }
+  if (s[key] && s[key].for === address) return hasPos(s[key]) ? s[key] : null;
+  const g = await geocode(address);
+  s[key] = { for: address, lat: g ? g.lat : null, lng: g ? g.lng : null };
+  save();
+  return g ? s[key] : null;
+}
+
+/* ========== CSV ========== */
+function parseCsv(text) {
+  const rows = []; let row = [], cell = '', q = false;
+  const delim = /\t/.test(text.split('\n')[0]) ? '\t' : ',';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) { if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += ch; }
+    else if (ch === '"') q = true;
+    else if (ch === delim) { row.push(cell); cell = ''; }
+    else if (ch === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+    else if (ch !== '\r') cell += ch;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows.map(r => r.map(c => c.trim())).filter(r => r.some(Boolean));
+}
+function toCustomers(rows) {
+  if (!rows.length) return [];
+  let col = rows[0].length >= 3 ? { no: 0, name: 1, address: 2, lat: 3, lng: 4 } : { no: 0, name: -1, address: 1, lat: -1, lng: -1 };
+  const head = rows[0].map(c => c.replace(/^﻿/, ''));
+  if (head.some(c => c.includes('住所'))) {
+    const f = re => head.findIndex(c => re.test(c));
+    col = { no: f(/番号|No/i), name: f(/名前|氏名/), address: f(/住所/), lat: f(/緯度/), lng: f(/経度/) };
+    rows = rows.slice(1);
+  }
+  return rows.map((r, i) => {
+    const address = r[col.address] || '', lat = parseFloat(r[col.lat]), lng = parseFloat(r[col.lng]), ok = Number.isFinite(lat) && Number.isFinite(lng);
+    return { id: uid() + i, no: r[col.no] || String(i + 1), name: col.name >= 0 ? (r[col.name] || '') : '', address, lat: ok ? lat : null, lng: ok ? lng : null, geoFor: ok ? address : null, geoTitle: '' };
+  }).filter(c => c.address);
+}
+function decodeFile(buf) {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+  catch (e) { return new TextDecoder('shift_jis').decode(buf); }      // Excelの標準CSV
+}
+function exportCsv() {
+  if (!confirm('CSVファイルは暗号化されず、名前と住所をそのまま読めます。保存しますか？\n保存先は安全な場所1か所にし、不要になったファイルは消してください。')) return;
+  const q = v => /[",\n]/.test(String(v ?? '')) ? `"${String(v).replace(/"/g, '""')}"` : (v ?? '');
+  const lines = [['番号', '名前', '住所', '緯度', '経度'], ...db.customers.map(c => [c.no, c.name, c.address, c.lat, c.lng])].map(r => r.map(q).join(','));
+  const url = URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' }));
+  const a = Object.assign(document.createElement('a'), { href: url, download: `顧客リスト_${dateStr()}.csv` });
+  a.click(); URL.revokeObjectURL(url);
+}
+
+/* ========== 画面 ========== */
+const view = document.getElementById('view'), bottom = document.getElementById('bottom'), makeBtn = document.getElementById('makeRoute');
+let tab = 'check', query = '', onlyChecked = false, routeState = null, busy = '';
+
+function show(t) { tab = t; render(); window.scrollTo(0, 0); }
+function render() {
+  if (!cryptoKey) return;
+  rollDay();
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  ({ check: renderCheck, route: renderRoute, list: renderList, set: renderSet })[tab]();
+  updateBottom();
+}
+function updateBottom() {
+  const n = db.today.checked.length;
+  bottom.hidden = tab !== 'check' || !db.customers.length;
+  makeBtn.textContent = `ルートを作る（${n}件）`;
+  makeBtn.disabled = !n;
+}
+
+function renderCheck() {
+  if (!db.customers.length) { view.innerHTML = `<div class="empty">顧客が登録されていません。<br><button class="primary" data-go="list">顧客リストを登録する</button></div>`; return; }
+  view.innerHTML = `
+    <div class="row-line"><input type="search" id="q" placeholder="番号・名前・住所で絞り込み" value="${h(query)}"></div>
+    <div class="row-line">
+      <label class="muted"><input type="checkbox" id="only" ${onlyChecked ? 'checked' : ''}> チェック済みだけ表示</label>
+      <span class="grow"></span><button id="clear">全部外す</button>
+    </div>
+    <div id="rows"></div>`;
+  drawRows();
+  document.getElementById('q').oninput = e => { query = e.target.value; drawRows(); };
+  document.getElementById('only').onchange = e => { onlyChecked = e.target.checked; drawRows(); };
+  document.getElementById('clear').onclick = () => { if (confirm('今日のチェックをすべて外しますか？')) { setChecked([]); drawRows(); updateBottom(); } };
+}
+function setChecked(ids) { db.today.checked = ids; db.today.order = null; routeState = null; save(); }
+function drawRows() {
+  const q = query.trim().toLowerCase(), ck = new Set(db.today.checked);
+  const rows = db.customers.filter(c => (!onlyChecked || ck.has(c.id)) && (!q || `${c.no} ${c.name} ${c.address}`.toLowerCase().includes(q)));
+  document.getElementById('rows').innerHTML = rows.map(c => `
+    <label class="cust ${ck.has(c.id) ? 'on' : ''}">
+      <input type="checkbox" data-ck="${h(c.id)}" ${ck.has(c.id) ? 'checked' : ''}>
+      <span class="no">${h(c.no)}</span>
+      <span class="grow">${c.name ? h(c.name) + '<br>' : ''}<span class="addr">${h(c.address)}</span></span>
+    </label>`).join('') || '<div class="empty">該当なし</div>';
+}
+
+async function makeRoute() {
+  const sess = lockSession;
+  busy = '位置を確認しています…'; show('route');
+  const ck = new Set(db.today.checked), stops = db.customers.filter(c => ck.has(c.id));
+  const s = db.settings, end = s.sameEnd ? s.start : s.end;
+  const ok = await ensurePositions(stops, (i, n) => {
+    if (sess !== lockSession) return false;
+    busy = `住所の位置を確認中（${i}/${n}）…`; renderRoute();
+  });
+  let startP = null, endP = null, netErr = !ok;
+  if (sess === lockSession) try { startP = await placeGeo('startGeo', s.start); endP = await placeGeo('endGeo', end); } catch (e) { netErr = true; }
+  if (sess !== lockSession) return;
+  busy = '';
+  const located = stops.filter(hasPos), lost = stops.filter(c => !hasPos(c));
+  const proposal = located.length >= 2 ? propose(located, s.start ? startP : null, end ? endP : null) : null;
+  const saved = db.today.order && db.today.order.length === stops.length && db.today.order.every(id => ck.has(id)) ? db.today.order : null;
+  routeState = { baseIds: stops.map(c => c.id), proposal: proposal && { ...proposal, order: [...proposal.order, ...lost].map(c => c.id) }, lostIds: lost.map(c => c.id), netErr, startMissing: !!s.start && !startP, startP, endP };
+  if (!saved) db.today.order = routeState.baseIds.slice();
+  save(); render();
+}
+const byId = id => db.customers.find(c => c.id === id);
+const sameOrder = (a, b) => a && b && a.length === b.length && a.every((v, i) => v === b[i]);
+const seqText = ids => ids.map(id => byId(id)?.no).join(' → ');
+
+function renderRoute() {
+  if (busy) { view.innerHTML = `<div class="empty">${h(busy)}</div>`; return; }
+  const st = routeState, order = db.today.order;
+  if (!st && order && order.length) { makeRoute(); return; }   // 再読み込みやロック解除の後は今日のルートを復元
+  if (!st || !order || !order.length) {
+    view.innerHTML = `<div class="empty">配達チェックで今日のお客様を選び、「ルートを作る」を押してください。<br><br><button class="primary" data-go="check">配達チェックへ</button></div>`;
+    return;
+  }
+  const stops = order.map(byId).filter(Boolean), s = db.settings, end = s.sameEnd ? s.start : s.end;
+  const startP = s.start ? st.startP : null, endP = end ? st.endP : null;
+  const isBase = sameOrder(order, st.baseIds), p = st.proposal, isProp = p && sameOrder(order, p.order);
+  const links = buildLinks(stops.map(c => c.address), s.start, end, s.maxWp);
+  const located = stops.filter(hasPos);
+  let warnings = '';
+  if (st.netErr) warnings += `<div class="card warn">通信できず、位置を確認できなかった住所があります。電波の良い場所で作り直すと提案が出ます。<br><button data-act="rebuild">作り直す</button></div>`;
+  if (!s.start) warnings += `<div class="card warn">出発地が未設定です。地図は現在地から始まり、提案の精度も下がります。<button data-go="set">設定する</button></div>`;
+  if (st.startMissing) warnings += `<div class="card warn">出発地の住所の位置が取得できませんでした。設定を確認してください。</div>`;
+  if (st.lostIds.length) warnings += `<div class="card warn"><b>位置が分からない住所：</b>${st.lostIds.map(id => h(label(byId(id)))).join('、')}<br>提案では最後に回しています。顧客リストで住所か緯度経度を直してください。</div>`;
+  const far = farOnes(located, startP);
+  if (far.length) warnings += `<div class="card warn"><b>位置が離れすぎています（住所の確認を）：</b>${far.map(c => h(label(c))).join('、')}</div>`;
+
+  let suggest = '';
+  if (p && !isProp) {
+    suggest = `<div class="card suggest"><h3>もっと短い順番があります</h3>
+      <div class="big">約${km(p.saved)} 短縮 <span class="muted">${km(p.baseLen)} → ${km(p.propLen)}（直線距離の目安）</span></div>
+      <p class="seq"><b>いつもの順：</b>${h(seqText(st.baseIds))}<br><b>提案：</b>${h(seqText(p.order))}</p>
+      <ul>${p.reasons.map(r => `<li>${h(r)}</li>`).join('')}</ul>
+      <p class="muted">一方通行・川・時間指定は考慮していません。事情があればいつもの順のままで大丈夫です。</p>
+      <button class="primary" data-act="useProp">提案の順番にする</button></div>`;
+  } else if (isProp) {
+    suggest = `<div class="card"><b>提案の順番を使用中</b>（いつもの順より約${km(p.saved)}短い目安）<div class="row-line"><button data-act="useBase">いつもの順に戻す</button></div></div>`;
+  } else if (isBase && !st.netErr && !st.lostIds.length && !st.startMissing && located.length >= 2) {
+    suggest = `<div class="card">いつもの順で問題ありません。これより明らかに短い順番は見つかりませんでした。</div>`;
+  } else if (!isBase) {
+    suggest = `<div class="card"><b>手動で並べ替えた順番です</b><div class="row-line"><button data-act="useBase">いつもの順に戻す</button></div></div>`;
+  }
+
+  view.innerHTML = `${warnings}${suggest}
+    <h2>今日のルート（${stops.length}件・${km(routeLen(located, startP, endP))}目安）</h2>
+    <div class="card">${links.map((l, i) => `
+      <a class="primary" href="${h(l.url)}" target="_blank" rel="noopener noreferrer">${links.length > 1 ? `区間${i + 1}：` : ''}${l.homeOnly ? '帰着地まで' : `${l.from}〜${l.to}軒目`}をGoogleマップで開く</a>`).join('')}
+      ${links.length > 1 ? `<p class="muted">Googleマップの上限のため${links.length}区間に分かれています。区間を走り終えたら次のボタンを押してください。</p>` : ''}
+    </div>
+    <div class="card">${stops.map((c, i) => `
+      <div class="stop">
+        <span class="idx">${i + 1}</span>
+        <span class="grow"><b>${h(label(c))}</b><br><span class="addr">${h(c.address)}</span></span>
+        <button class="mv" data-up="${i}" ${i ? '' : 'disabled'} aria-label="上へ">↑</button>
+        <button class="mv" data-down="${i}" ${i < stops.length - 1 ? '' : 'disabled'} aria-label="下へ">↓</button>
+      </div>`).join('')}</div>`;
+}
+function farOnes(list, start) {
+  if (!list.length) return [];
+  const mid = a => a.slice().sort((x, y) => x - y)[a.length >> 1];
+  const base = start || { lat: mid(list.map(c => c.lat)), lng: mid(list.map(c => c.lng)) };
+  return list.filter(c => dist(base, c) > FAR_KM);
+}
+function moveStop(i, d) {
+  const o = db.today.order, j = i + d;
+  [o[i], o[j]] = [o[j], o[i]];
+  save(); renderRoute();
+}
+
+function renderList() {
+  view.innerHTML = `
+    <p class="muted">上から順が「いつもの順」です。チェックした人だけを残した順番が毎日の基本ルートになります。</p>
+    <div class="row-line"><button class="primary" data-act="add">＋ 顧客を追加</button><button data-act="import">まとめて登録</button><button data-act="export" ${db.customers.length ? '' : 'disabled'}>CSVに保存</button></div>
+    ${db.customers.map((c, i) => `
+      <div class="cust" style="cursor:default">
+        <input class="pos" type="number" min="1" max="${db.customers.length}" value="${i + 1}" data-pos="${i}" aria-label="順番">
+        <span class="grow"><b>${h(label(c))}</b><br><span class="addr">${h(c.address)}</span></span>
+        <button data-edit="${h(c.id)}">編集</button>
+      </div>`).join('') || '<div class="empty">まだ登録がありません</div>'}`;
+}
+function editDialog(c) {
+  const isNew = !c; c = c || { id: uid(), no: String(db.customers.length + 1), name: '', address: '' };
+  const coords = hasPos(c) ? `${c.lat}, ${c.lng}` : '';
+  dlgForm.innerHTML = `
+    <h3 style="margin:0">${isNew ? '顧客を追加' : '顧客を編集'}</h3>
+    <label class="f">番号<input type="text" id="fNo" value="${h(c.no)}"></label>
+    <label class="f">名前（省略可）<input type="text" id="fName" value="${h(c.name)}"></label>
+    <label class="f">住所<input type="text" id="fAddr" value="${h(c.address)}"></label>
+    <label class="f">緯度, 経度（住所の位置がずれるときだけ。Googleマップで地点を長押しすると表示されます）
+      <input type="text" id="fPos" value="${h(coords)}" placeholder="例: 34.6938, 135.5012"></label>
+    ${c.geoTitle ? `<p class="muted">位置の検索結果：${h(c.geoTitle)}</p>` : ''}
+    <div class="row-line"><button class="primary" value="ok">保存</button><button value="cancel" formnovalidate>やめる</button>${isNew ? '' : '<button class="danger" value="del">削除</button>'}</div>`;
+  dlg.returnValue = '';
+  dlg.onclose = () => {
+    if (dlg.returnValue === 'del') {
+      if (!confirm(`${label(c)} を削除しますか？`)) return;
+      db.customers = db.customers.filter(x => x !== c);
+      setChecked(db.today.checked.filter(id => id !== c.id));
+    } else if (dlg.returnValue === 'ok') {
+      const address = fAddr.value.trim();
+      if (!address) { alert('住所を入力してください'); return; }
+      const m = fPos.value.match(/(-?\d+(?:\.\d+)?)\s*[,、\s]\s*(-?\d+(?:\.\d+)?)/);
+      const prevPos = coords, posEdited = fPos.value.trim() !== prevPos;
+      Object.assign(c, { no: fNo.value.trim() || c.no, name: fName.value.trim(), address });
+      if (m) {
+        if (posEdited || c.geoFor !== address) { c.lat = +m[1]; c.lng = +m[2]; c.geoFor = address; c.geoTitle = '手入力'; }
+      } else { c.lat = c.lng = null; c.geoFor = null; c.geoTitle = ''; }
+      if (isNew) db.customers.push(c);
+      routeState = null;
+      save();
+    } else return;
+    render();
+  };
+  dlg.showModal();
+}
+function importDialog() {
+  dlgForm.innerHTML = `
+    <h3 style="margin:0">まとめて登録</h3>
+    <p class="muted">Excelからの貼り付けか、CSVファイルで登録できます。行の順番が「いつもの順」になります。<br>列：番号, 名前, 住所（名前なしの「番号, 住所」でも可）</p>
+    <textarea id="fCsv" rows="8" placeholder="1,山田,大阪府大阪市…&#10;2,佐藤,大阪府大阪市…"></textarea>
+    <div class="row-line"><input type="file" id="fFile" accept=".csv,.txt,text/csv"></div>
+    <p class="muted" style="color:var(--bad)">今の顧客リストは置き換えられ、今日のチェックも外れます。</p>
+    <div class="row-line"><button class="primary" value="ok">登録</button><button value="cancel">やめる</button></div>`;
+  fFile.onchange = async () => { if (fFile.files[0]) fCsv.value = decodeFile(await fFile.files[0].arrayBuffer()); };
+  dlg.returnValue = '';
+  dlg.onclose = () => {
+    if (dlg.returnValue !== 'ok') return;
+    const list = toCustomers(parseCsv(fCsv.value));
+    if (!list.length) { alert('読み取れる行がありませんでした。列の形式を確認してください。'); return; }
+    if (db.customers.length && !confirm(`今の${db.customers.length}件を、${list.length}件で置き換えますか？`)) return;
+    db.customers = list; setChecked([]); render();
+    alert(`${list.length}件を登録しました`);
+  };
+  dlg.showModal();
+}
+
+function renderSet() {
+  const s = db.settings;
+  view.innerHTML = `
+    <h2>ルート</h2>
+    <label class="f">出発地（営業所など）<input type="text" id="sStart" value="${h(s.start)}" placeholder="住所を入力"></label>
+    <label class="f"><input type="checkbox" id="sSame" ${s.sameEnd ? 'checked' : ''}> 出発地に戻る</label>
+    <label class="f" id="endWrap" ${s.sameEnd ? 'hidden' : ''}>帰着地（空なら最後の配達先で終了）<input type="text" id="sEnd" value="${h(s.end)}"></label>
+    <label class="f">1区間に入れる経由地の数
+      <select id="sWp"><option value="9" ${s.maxWp == 9 ? 'selected' : ''}>9件（アプリで開く場合）</option><option value="3" ${s.maxWp == 3 ? 'selected' : ''}>3件（スマホのブラウザで開く場合）</option></select></label>
+    <h2>セキュリティ</h2>
+    <label class="f">操作しないとロックするまでの時間
+      <select id="sLock">${[5, 15, 30, 60].map(m => `<option value="${m}" ${s.autoLockMin == m ? 'selected' : ''}>${m}分</option>`).join('')}</select></label>
+    <div class="row-line"><button data-act="lockNow">今すぐロック</button><button data-act="changePin">PINを変更</button></div>
+    <h2>個人情報の扱い</h2>
+    <div class="card muted">
+      顧客データと設定は、この端末のブラウザ内にPINで暗号化して保存されます。<br>
+      住所は位置確認のため国土地理院へ、地図表示のためGoogleへ送られます。名前と番号は送信しません。<br>
+      ブラウザのデータを消すとリストも消え、PINを忘れると元に戻せません。顧客画面の「CSVに保存」で控えを1つ、安全な場所に保管してください。
+    </div>
+    <h2>データ</h2>
+    <button class="danger" data-act="wipe">この端末のデータをすべて消す</button>`;
+  const saveS = () => { s.start = sStart.value.trim(); s.sameEnd = sSame.checked; s.end = sEnd.value.trim(); s.maxWp = +sWp.value; s.autoLockMin = +sLock.value; routeState = null; save(); endWrap.hidden = s.sameEnd; };
+  [sStart, sSame, sEnd, sWp, sLock].forEach(el => el.onchange = saveS);
+}
+function changePinDialog() {
+  dlgForm.innerHTML = `
+    <h3 style="margin:0">PINを変更</h3>
+    <label class="f">今のPIN<input type="password" inputmode="numeric" autocomplete="off" id="pOld"></label>
+    <label class="f">新しいPIN（6桁以上の数字）<input type="password" inputmode="numeric" autocomplete="off" id="pNew"></label>
+    <label class="f">新しいPIN（確認）<input type="password" inputmode="numeric" autocomplete="off" id="pNew2"></label>
+    <div class="row-line"><button class="primary" value="ok">変更</button><button value="cancel">やめる</button></div>`;
+  dlg.returnValue = '';
+  dlg.onclose = async () => {
+    if (dlg.returnValue !== 'ok') return;
+    const oldPin = pOld.value, pin = pNew.value, problem = pinProblem(pin);
+    if (problem) { alert(problem); return; }
+    if (pin !== pNew2.value) { alert('新しいPINが一致しません'); return; }
+    await saveQueue;
+    if (!await openRecord(oldPin)) { alert('今のPINが違います'); return; }
+    await setPin(pin, db);
+    alert('PINを変更しました');
+  };
+  dlg.showModal();
+}
+
+/* ========== ロック画面 ========== */
+const gate = document.getElementById('gate');
+function readFails() { try { return JSON.parse(localStorage.getItem(KEY_FAIL)) || { n: 0, until: 0 }; } catch (e) { return { n: 0, until: 0 }; } }
+function afterUnlock() {
+  gate.innerHTML = '';
+  document.body.classList.remove('locked');
+  lastActive = Date.now();
+  rollDay();
+  tab = db.today.order && db.today.order.length ? 'route' : 'check';
+  render();
+}
+function showGate(mode) {
+  document.body.classList.add('locked');
+  const setup = mode === 'setup', migrating = setup && !!readV1();
+  gate.innerHTML = `<form id="gForm">
+    <h1>${setup ? 'PINを決めてください' : '配達ルート'}</h1>
+    <p class="muted">${setup ? `6桁以上の数字にしてください。顧客データはこのPINで暗号化されます。<br><b>PINを忘れるとデータは元に戻せません。</b>${migrating ? '<br>登録済みのデータは暗号化して引き継ぎます。' : ''}` : 'PINを入力してください'}</p>
+    <input type="password" inputmode="numeric" autocomplete="off" id="gPin" aria-label="PIN" autofocus>
+    ${setup ? '<p class="muted">確認のためもう一度</p><input type="password" inputmode="numeric" autocomplete="off" id="gPin2" aria-label="PIN確認">' : ''}
+    <p class="err" id="gErr" role="alert"></p>
+    <button class="primary" id="gOk">${setup ? 'このPINで始める' : 'ロック解除'}</button>
+    ${setup ? '' : '<button type="button" class="link" id="gForgot">PINを忘れた</button>'}
+  </form>`;
+  const err = document.getElementById('gErr'), ok = document.getElementById('gOk'), pinEl = document.getElementById('gPin');
+  document.getElementById('gForm').onsubmit = async e => {
+    e.preventDefault();
+    err.textContent = '';
+    const pin = pinEl.value;
+    ok.disabled = true;
+    try {
+      if (setup) {
+        const problem = pinProblem(pin);
+        if (problem) { err.textContent = problem; return; }
+        if (pin !== document.getElementById('gPin2').value) { err.textContent = 'PINが一致しません'; return; }
+        await setPin(pin, readV1() || blank());
+        localStorage.removeItem(KEY_V1);
+        afterUnlock();
+        return;
+      }
+      const f = readFails();
+      if (Date.now() < f.until) { err.textContent = `入力を間違えすぎました。あと${Math.ceil((f.until - Date.now()) / 1000)}秒待ってください`; return; }
+      const opened = await openRecord(pin);
+      if (!opened) {
+        f.n++;
+        if (f.n >= 5) f.until = Date.now() + Math.min(30000 * 2 ** (f.n - 5), 3600000);
+        localStorage.setItem(KEY_FAIL, JSON.stringify(f));
+        pinEl.value = '';
+        err.textContent = 'PINが違います';
+        return;
+      }
+      localStorage.removeItem(KEY_FAIL);
+      cryptoKey = opened.key; keyMeta = opened.meta; db = opened.data;
+      afterUnlock();
+    } finally { ok.disabled = false; }
+  };
+  const forgot = document.getElementById('gForgot');
+  if (forgot) forgot.onclick = () => {
+    if (prompt('PINが分からないとデータは読めません。\nこの端末の顧客データをすべて消して最初からやり直す場合は「削除」と入力してください。') !== '削除') return;
+    wipeAll();
+  };
+}
+function lock() {
+  if (!cryptoKey) return;
+  lockSession++;
+  cryptoKey = null; keyMeta = null; db = blank(); routeState = null; busy = ''; query = '';
+  if (dlg.open) dlg.close('cancel');
+  view.innerHTML = '';
+  showGate('unlock');
+}
+function wipeAll() {
+  lockSession++;
+  cryptoKey = null; keyMeta = null; db = blank(); routeState = null; busy = ''; view.innerHTML = '';
+  [KEY_ENC, KEY_FAIL, KEY_V1].forEach(k => localStorage.removeItem(k));
+  showGate('setup');
+}
+function checkIdle() {
+  if (cryptoKey && !busy && Date.now() - lastActive > db.settings.autoLockMin * 60000) lock();
+}
+['pointerdown', 'keydown', 'scroll'].forEach(ev => addEventListener(ev, () => { lastActive = Date.now(); }, { passive: true }));
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkIdle(); });
+setInterval(checkIdle, 30000);
+
+const dlg = document.getElementById('dlg'), dlgForm = document.getElementById('dlgForm');
+document.getElementById('tabs').onclick = e => { const t = e.target.dataset.tab; if (t) show(t); };
+makeBtn.onclick = makeRoute;
+view.addEventListener('change', e => {
+  const t = e.target;
+  if (t.dataset.ck) {
+    const set = new Set(db.today.checked);
+    t.checked ? set.add(t.dataset.ck) : set.delete(t.dataset.ck);
+    setChecked([...set]);
+    t.closest('.cust').classList.toggle('on', t.checked);
+    if (onlyChecked && !t.checked) drawRows();
+    updateBottom();
+  }
+  if (t.dataset.pos !== undefined) {
+    const from = +t.dataset.pos, to = Math.min(Math.max(+t.value || 1, 1), db.customers.length) - 1;
+    const [c] = db.customers.splice(from, 1); db.customers.splice(to, 0, c);
+    routeState = null; db.today.order = null; save(); renderList();
+  }
+});
+view.addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const d = b.dataset;
+  if (d.go) show(d.go);
+  if (d.edit) editDialog(byId(d.edit));
+  if (d.up) moveStop(+d.up, -1);
+  if (d.down) moveStop(+d.down, 1);
+  if (d.act === 'add') editDialog();
+  if (d.act === 'import') importDialog();
+  if (d.act === 'export') exportCsv();
+  if (d.act === 'rebuild') makeRoute();
+  if (d.act === 'useProp') { db.today.order = routeState.proposal.order.slice(); save(); renderRoute(); window.scrollTo(0, 0); }
+  if (d.act === 'useBase') { db.today.order = routeState.baseIds.slice(); save(); renderRoute(); }
+  if (d.act === 'lockNow') lock();
+  if (d.act === 'changePin') changePinDialog();
+  if (d.act === 'wipe' && confirm('顧客リストと設定をすべて消します。よろしいですか？')) wipeAll();
+});
+if (!window.crypto || !crypto.subtle) {
+  gate.innerHTML = '<div class="empty">この開き方では暗号化が使えません。https:// のURLから開いてください。</div>';
+} else {
+  showGate(readRecord() ? 'unlock' : 'setup');
+}
+</script>
+</body>
+</html>
