@@ -61,6 +61,11 @@ body.locked .tabs,body.locked main,body.locked .bottom{display:none}
 #gate button{width:100%;margin-top:12px}
 #gate button.link{border:0;background:none;color:var(--sub);text-decoration:underline}
 .err{color:var(--bad);min-height:1.5em;font-size:14px;margin:8px 0 0}
+.sg{margin:-4px 0 10px}
+.sg button{display:block;width:100%;text-align:left;margin-top:4px;font-size:15px;background:var(--soft);border-color:var(--main);overflow-wrap:anywhere}
+.sg a,.issue a{font-size:14px;color:var(--main)}
+.issue{border-top:1px solid var(--line);padding:10px 0}
+.issue:first-of-type{border-top:0}
 </style>
 </head>
 <body class="locked">
@@ -274,24 +279,120 @@ function buildLinks(addresses, start, end, maxWp) {  // 上限を超えないよ
   return links;
 }
 
-/* ========== 住所→位置（国土地理院の住所検索。送るのは住所のみ） ========== */
-async function geocode(address) {
-  const r = await fetch('https://msearch.gsi.go.jp/address-search/AddressSearch?q=' + encodeURIComponent(address), { referrerPolicy: 'no-referrer' });
+/* ========== 住所→候補・位置（国土地理院の住所検索。送るのは住所のみ） ========== */
+const GEO_V = 2;                                  // 大まかな一致を位置として使わない判定の版
+const KAN = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+function kanToNum(k) {
+  let total = 0, cur = 0;
+  for (const ch of k) { if (ch === '十') { total += (cur || 1) * 10; cur = 0; } else cur = KAN[ch]; }
+  return total + cur;
+}
+function z2h(s) {
+  return String(s).replace(/[０-９Ａ-Ｚａ-ｚ]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+    .replace(/　/g, ' ').replace(/(\d)\s*[－ー−‐―ｰ-]\s*(?=\d)/g, '$1-');
+}
+const normNums = s => z2h(s).replace(/([一二三四五六七八九十]+)(丁目|条|番地?|号|線)/g, (_, k, u) => kanToNum(k) + u);
+function splitBuilding(input) {                   // 「1-2-3 ○○ハイツ101」を番地までと建物名に分ける
+  const n = normNums(input).trim(), d = /\d/.exec(n);
+  if (!d) return { main: n, building: '' };
+  const b = n.slice(d.index).search(/[\sァ-ヺ]/);
+  return b < 0 ? { main: n, building: '' } : { main: n.slice(0, d.index + b).trim(), building: ' ' + n.slice(d.index + b).trim() };
+}
+const numsOf = s => s.match(/\d+/g) || [];
+const fold = s => s.replace(/[ヶケが]/g, 'ケ').replace(/[ノの之]/g, 'の');
+function isCoarse(input, title) {                 // 例：「三重県一志町高野」に「三重県」だけが返った状態
+  const { main } = splitBuilding(input), d = /\d/.exec(main), head = d ? main.slice(0, d.index) : main;
+  if (head.length < 2) return false;
+  return !fold(title).includes(fold(head.slice(-2)));
+}
+function composeAddress(input, title) {           // 正式な地名に、入力された番地と建物名を付け直す
+  const { main, building } = splitBuilding(input), t = normNums(title), inN = numsOf(main), tN = numsOf(t);
+  const left = tN.every((x, i) => x === inN[i]) ? inN.slice(tN.length) : [];
+  const sep = !tN.length || /番$/.test(t) ? '' : '-';
+  return z2h(title) + (left.length ? sep + left.join('-') : '') + building;
+}
+const searchCache = new Map();
+async function rawSearch(q) {
+  if (searchCache.has(q)) return searchCache.get(q);
+  const r = await fetch('https://msearch.gsi.go.jp/address-search/AddressSearch?q=' + encodeURIComponent(q), { referrerPolicy: 'no-referrer' });
   if (!r.ok) throw new Error('HTTP ' + r.status);
-  const j = await r.json();
-  if (!j.length) return null;
-  const [lng, lat] = j[0].geometry.coordinates;
-  return { lat, lng, title: j[0].properties.title };
+  const list = (await r.json())
+    .map(x => ({ title: x.properties.title, lng: x.geometry.coordinates[0], lat: x.geometry.coordinates[1] }));
+  searchCache.set(q, list);
+  return list;
+}
+const hasPref = t => /^.{2,3}[都道府県]/.test(t);
+async function candidates(input) {                // 県名や郡名を外した検索も試し、合併前の住所も拾う
+  const { main } = splitBuilding(input);
+  const prefM = main.match(/^.{2,3}[都道府県]/), pref = prefM ? prefM[0] : '';
+  const noPref = main.slice(pref.length), noGun = noPref.replace(/^.*?郡/, '');
+  const d = /\d/.exec(noGun), headOnly = d ? noGun.slice(0, d.index) : noGun;
+  let found = [];
+  for (const q of [...new Set([input.trim(), main, noPref, noGun, headOnly])].filter(Boolean)) {
+    found = (await rawSearch(q)).filter(r => hasPref(r.title) && !isCoarse(input, r.title));
+    if (found.length) break;
+  }
+  if (!found.length) {                            // 例：松阪市神ノ木町 → 町名だけで探し「嬉野神ノ木町」を見つけて市名を付け直す
+    const city = (headOnly.match(/^.*?市/) || [''])[0];
+    const town = headOnly.slice(city.length).replace(/^.*?区/, '');
+    const variants = [...new Set([town, town.replace(/の/g, 'ノ'), town.replace(/ノ/g, 'の')])];
+    for (const t of city && town.length >= 2 ? variants : []) {
+      const hints = (await rawSearch(t)).filter(r => !hasPref(r.title) && fold(r.title).endsWith(fold(town)));
+      for (const hint of hints.slice(0, 6)) {
+        const res = await rawSearch(city + hint.title);
+        found.push(...res.filter(r => hasPref(r.title) && (!pref || r.title.startsWith(pref)) && fold(r.title).endsWith(fold(hint.title))));
+      }
+      if (found.length) break;
+    }
+  }
+  const seen = new Set();
+  return found.slice().sort((a, b) => (b.title.startsWith(pref) && pref ? 1 : 0) - (a.title.startsWith(pref) && pref ? 1 : 0))
+    .map(r => ({ ...r, address: composeAddress(input, r.title) }))
+    .filter(r => !seen.has(r.address) && seen.add(r.address)).slice(0, 5);
+}
+async function geocode(address) {
+  const list = await candidates(address);
+  return list.length ? list[0] : null;
+}
+const addressKey = s => fold(normNums(s)).replace(/[\s\-丁目番地号の]/g, '');
+const mapSearchUrl = a => 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(a);
+const needsGeo = c => !c.manualPos && (c.geoFor !== c.address || c.geoV !== GEO_V);
+function attachSuggest(input, box, onPick) {      // 入力中に正式な住所の候補を出す
+  let timer, seq = 0, list = [];
+  const link = () => input.value.trim() ? `<a href="${h(mapSearchUrl(input.value.trim()))}" target="_blank" rel="noopener noreferrer">この住所をGoogleマップで確認</a>` : '';
+  const draw = (html = '') => { box.innerHTML = html + link(); };
+  input.addEventListener('input', () => {
+    clearTimeout(timer); seq++; list = [];
+    const v = input.value.trim();
+    draw();
+    if (v.length < 4) return;
+    const my = seq;
+    timer = setTimeout(async () => {
+      let res;
+      try { res = await candidates(v); } catch (e) { if (my === seq) draw('<p class="muted">通信できず、候補を出せませんでした。</p>'); return; }
+      if (my !== seq) return;
+      list = res;
+      draw(res.length ? res.map((r, i) => `<button type="button" data-i="${i}">${h(r.address)}</button>`).join('')
+        : '<p class="muted">候補が見つかりません。市町村の合併などで住所が変わっていないか確認してください。</p>');
+    }, 500);
+  });
+  box.addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    const r = list[+b.dataset.i]; if (!r) return;
+    input.value = r.address; seq++; list = []; draw();
+    if (onPick) onPick(r);
+  });
+  draw();
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function ensurePositions(list, onStep) {
   let netErr = false, done = 0;
-  const todo = list.filter(c => c.geoFor !== c.address);
+  const todo = list.filter(needsGeo);
   for (const c of todo) {
     if (onStep(++done, todo.length) === false) return false;
     try {
       const g = await geocode(c.address);
-      c.lat = g ? g.lat : null; c.lng = g ? g.lng : null; c.geoTitle = g ? g.title : ''; c.geoFor = c.address;
+      c.lat = g ? g.lat : null; c.lng = g ? g.lng : null; c.geoTitle = g ? g.title : ''; c.geoFor = c.address; c.geoV = GEO_V;
       save();
     } catch (e) { netErr = true; break; }
     await sleep(120);
@@ -301,9 +402,9 @@ async function ensurePositions(list, onStep) {
 async function placeGeo(key, address) {
   const s = db.settings;
   if (!address) { s[key] = null; return null; }
-  if (s[key] && s[key].for === address) return hasPos(s[key]) ? s[key] : null;
+  if (s[key] && s[key].for === address && s[key].v === GEO_V) return hasPos(s[key]) ? s[key] : null;
   const g = await geocode(address);
-  s[key] = { for: address, lat: g ? g.lat : null, lng: g ? g.lng : null };
+  s[key] = { for: address, v: GEO_V, lat: g ? g.lat : null, lng: g ? g.lng : null };
   save();
   return g ? s[key] : null;
 }
@@ -325,16 +426,16 @@ function parseCsv(text) {
 }
 function toCustomers(rows) {
   if (!rows.length) return [];
-  let col = rows[0].length >= 3 ? { no: 0, name: 1, address: 2, lat: 3, lng: 4 } : { no: 0, name: -1, address: 1, lat: -1, lng: -1 };
+  let col = rows[0].length >= 3 ? { no: 0, name: 1, address: 2, lat: 3, lng: 4, manual: 5 } : { no: 0, name: -1, address: 1, lat: -1, lng: -1, manual: -1 };
   const head = rows[0].map(c => c.replace(/^﻿/, ''));
   if (head.some(c => c.includes('住所'))) {
     const f = re => head.findIndex(c => re.test(c));
-    col = { no: f(/番号|No/i), name: f(/名前|氏名/), address: f(/住所/), lat: f(/緯度/), lng: f(/経度/) };
+    col = { no: f(/番号|No/i), name: f(/名前|氏名/), address: f(/住所/), lat: f(/緯度/), lng: f(/経度/), manual: f(/位置指定/) };
     rows = rows.slice(1);
   }
   return rows.map((r, i) => {
     const address = r[col.address] || '', lat = parseFloat(r[col.lat]), lng = parseFloat(r[col.lng]), ok = Number.isFinite(lat) && Number.isFinite(lng);
-    return { id: uid() + i, no: r[col.no] || String(i + 1), name: col.name >= 0 ? (r[col.name] || '') : '', address, lat: ok ? lat : null, lng: ok ? lng : null, geoFor: ok ? address : null, geoTitle: '' };
+    return { id: uid() + i, no: r[col.no] || String(i + 1), name: col.name >= 0 ? (r[col.name] || '') : '', address, lat: ok ? lat : null, lng: ok ? lng : null, geoFor: ok ? address : null, geoV: ok ? GEO_V : null, manualPos: ok && r[col.manual] === '1', geoTitle: '' };
   }).filter(c => c.address);
 }
 function decodeFile(buf) {
@@ -344,7 +445,7 @@ function decodeFile(buf) {
 function exportCsv() {
   if (!confirm('CSVファイルは暗号化されず、名前と住所をそのまま読めます。保存しますか？\n保存先は安全な場所1か所にし、不要になったファイルは消してください。')) return;
   const q = v => /[",\n]/.test(String(v ?? '')) ? `"${String(v).replace(/"/g, '""')}"` : (v ?? '');
-  const lines = [['番号', '名前', '住所', '緯度', '経度'], ...db.customers.map(c => [c.no, c.name, c.address, c.lat, c.lng])].map(r => r.map(q).join(','));
+  const lines = [['番号', '名前', '住所', '緯度', '経度', '位置指定'], ...db.customers.map(c => [c.no, c.name, c.address, c.lat, c.lng, c.manualPos ? 1 : ''])].map(r => r.map(q).join(','));
   const url = URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' }));
   const a = Object.assign(document.createElement('a'), { href: url, download: `顧客リスト_${dateStr()}.csv` });
   a.click(); URL.revokeObjectURL(url);
@@ -430,7 +531,7 @@ function renderRoute() {
   const stops = order.map(byId).filter(Boolean), s = db.settings, end = s.sameEnd ? s.start : s.end;
   const startP = s.start ? st.startP : null, endP = end ? st.endP : null;
   const isBase = sameOrder(order, st.baseIds), p = st.proposal, isProp = p && sameOrder(order, p.order);
-  const links = buildLinks(stops.map(c => c.address), s.start, end, s.maxWp);
+  const links = buildLinks(stops.map(c => c.manualPos && hasPos(c) ? `${c.lat},${c.lng}` : c.address), s.start, end, s.maxWp);
   const located = stops.filter(hasPos);
   let warnings = '';
   if (st.netErr) warnings += `<div class="card warn">通信できず、位置を確認できなかった住所があります。電波の良い場所で作り直すと提案が出ます。<br><button data-act="rebuild">作り直す</button></div>`;
@@ -485,13 +586,55 @@ function moveStop(i, d) {
 function renderList() {
   view.innerHTML = `
     <p class="muted">上から順が「いつもの順」です。チェックした人だけを残した順番が毎日の基本ルートになります。</p>
-    <div class="row-line"><button class="primary" data-act="add">＋ 顧客を追加</button><button data-act="import">まとめて登録</button><button data-act="export" ${db.customers.length ? '' : 'disabled'}>CSVに保存</button></div>
+    <div class="row-line"><button class="primary" data-act="add">＋ 顧客を追加</button><button data-act="import">まとめて登録</button><button data-act="checkAll" ${db.customers.length && !checking ? '' : 'disabled'}>${checking ? h(checking) : '住所を確認'}</button><button data-act="export" ${db.customers.length ? '' : 'disabled'}>CSVに保存</button></div>
+    ${issuesHtml()}
     ${db.customers.map((c, i) => `
       <div class="cust" style="cursor:default">
         <input class="pos" type="number" min="1" max="${db.customers.length}" value="${i + 1}" data-pos="${i}" aria-label="順番">
         <span class="grow"><b>${h(label(c))}</b><br><span class="addr">${h(c.address)}</span></span>
         <button data-edit="${h(c.id)}">編集</button>
       </div>`).join('') || '<div class="empty">まだ登録がありません</div>'}`;
+}
+let checking = '', issues = null;
+function issuesHtml() {
+  if (!issues) return '';
+  const list = issues.map(x => ({ ...x, c: byId(x.id) })).filter(x => x.c);
+  if (!list.length) return '<div class="card">確認した住所に問題は見つかりませんでした。念のため、配達先は地図でも確かめてください。</div>';
+  return `<div class="card warn"><h3>確認が必要な住所（${list.length}件）</h3>${list.map(x => `
+    <div class="issue">
+      <b>${h(label(x.c))}</b><br>
+      今の住所：${h(x.c.address)}<br>
+      ${x.best ? `候補：<b>${h(x.best.address)}</b>` : '候補が見つかりません。'}
+      <div class="row-line">
+        ${x.best ? `<button class="primary" data-fix="${h(x.id)}">候補に変更</button>` : ''}
+        <button data-edit="${h(x.id)}">編集</button>
+        <a href="${h(mapSearchUrl(x.best ? x.best.address : x.c.address))}" target="_blank" rel="noopener noreferrer">Googleマップで確認</a>
+      </div>
+    </div>`).join('')}</div>`;
+}
+async function checkAll() {                       // 全員の住所を調べ、書き換えが必要なものだけ一覧にする
+  const sess = lockSession, list = db.customers.filter(c => !c.manualPos), found = [];
+  for (let i = 0; i < list.length; i++) {
+    if (sess !== lockSession) return;
+    checking = `確認中 ${i + 1}/${list.length}`; if (tab === 'list') renderList();
+    const c = list[i];
+    try {
+      const best = (await candidates(c.address))[0] || null;
+      c.lat = best ? best.lat : null; c.lng = best ? best.lng : null; c.geoTitle = best ? best.title : ''; c.geoFor = c.address; c.geoV = GEO_V;
+      if (!best || addressKey(best.address) !== addressKey(c.address)) found.push({ id: c.id, best });
+      save();
+    } catch (e) { checking = ''; issues = found; renderList(); alert('通信できず、途中で止まりました。電波の良い場所でもう一度押してください。'); return; }
+    await sleep(120);
+  }
+  checking = ''; issues = found; routeState = null;
+  if (tab === 'list') renderList();
+}
+function fixAddress(id) {
+  const x = issues.find(i => i.id === id), c = byId(id);
+  if (!x || !x.best || !c) return;
+  Object.assign(c, { address: x.best.address, lat: x.best.lat, lng: x.best.lng, geoTitle: x.best.title, geoFor: x.best.address, geoV: GEO_V, manualPos: false });
+  issues = issues.filter(i => i.id !== id);
+  routeState = null; save(); renderList();
 }
 function editDialog(c) {
   const isNew = !c; c = c || { id: uid(), no: String(db.customers.length + 1), name: '', address: '' };
@@ -500,11 +643,13 @@ function editDialog(c) {
     <h3 style="margin:0">${isNew ? '顧客を追加' : '顧客を編集'}</h3>
     <label class="f">番号<input type="text" id="fNo" value="${h(c.no)}"></label>
     <label class="f">名前（省略可）<input type="text" id="fName" value="${h(c.name)}"></label>
-    <label class="f">住所<input type="text" id="fAddr" value="${h(c.address)}"></label>
-    <label class="f">緯度, 経度（住所の位置がずれるときだけ。Googleマップで地点を長押しすると表示されます）
-      <input type="text" id="fPos" value="${h(coords)}" placeholder="例: 34.6938, 135.5012"></label>
+    <label class="f">住所<input type="text" id="fAddr" value="${h(c.address)}" autocomplete="off" placeholder="例：大阪府大阪市北区中之島1-3-20"></label>
+    <div class="sg" id="fAddrBox"></div>
+    <label class="f">緯度, 経度（Googleマップで住所が出ないときだけ。地点を長押しすると表示されます。入れると地図はこの地点を案内します）
+      <input type="text" id="fPos" value="${h(c.manualPos ? coords : '')}" placeholder="例: 34.6938, 135.5012"></label>
     ${c.geoTitle ? `<p class="muted">位置の検索結果：${h(c.geoTitle)}</p>` : ''}
     <div class="row-line"><button class="primary" value="ok">保存</button><button value="cancel" formnovalidate>やめる</button>${isNew ? '' : '<button class="danger" value="del">削除</button>'}</div>`;
+  attachSuggest(fAddr, fAddrBox);
   dlg.returnValue = '';
   dlg.onclose = () => {
     if (dlg.returnValue === 'del') {
@@ -515,12 +660,16 @@ function editDialog(c) {
       const address = fAddr.value.trim();
       if (!address) { alert('住所を入力してください'); return; }
       const m = fPos.value.match(/(-?\d+(?:\.\d+)?)\s*[,、\s]\s*(-?\d+(?:\.\d+)?)/);
-      const prevPos = coords, posEdited = fPos.value.trim() !== prevPos;
+      const posText = fPos.value.trim(), posEdited = posText !== (c.manualPos ? coords : ''), changed = address !== c.address;
+      if (posText && !m) { alert('緯度, 経度の形式が読み取れないため、位置は保存しませんでした'); }
       Object.assign(c, { no: fNo.value.trim() || c.no, name: fName.value.trim(), address });
-      if (m) {
-        if (posEdited || c.geoFor !== address) { c.lat = +m[1]; c.lng = +m[2]; c.geoFor = address; c.geoTitle = '手入力'; }
-      } else { c.lat = c.lng = null; c.geoFor = null; c.geoTitle = ''; }
+      if (m && (posEdited || c.manualPos)) {
+        Object.assign(c, { lat: +m[1], lng: +m[2], geoFor: address, geoV: GEO_V, geoTitle: '手入力', manualPos: true });
+      } else if (changed || c.manualPos) {
+        Object.assign(c, { lat: null, lng: null, geoFor: null, geoV: null, geoTitle: '', manualPos: false });
+      }
       if (isNew) db.customers.push(c);
+      if (issues) issues = issues.filter(i => i.id !== c.id);
       routeState = null;
       save();
     } else return;
@@ -543,8 +692,8 @@ function importDialog() {
     const list = toCustomers(parseCsv(fCsv.value));
     if (!list.length) { alert('読み取れる行がありませんでした。列の形式を確認してください。'); return; }
     if (db.customers.length && !confirm(`今の${db.customers.length}件を、${list.length}件で置き換えますか？`)) return;
-    db.customers = list; setChecked([]); render();
-    alert(`${list.length}件を登録しました`);
+    db.customers = list; issues = null; setChecked([]); render();
+    alert(`${list.length}件を登録しました。続けて「住所を確認」を押すと、地図に出ない可能性がある住所を確認できます。`);
   };
   dlg.showModal();
 }
@@ -553,9 +702,13 @@ function renderSet() {
   const s = db.settings;
   view.innerHTML = `
     <h2>ルート</h2>
-    <label class="f">出発地（営業所など）<input type="text" id="sStart" value="${h(s.start)}" placeholder="住所を入力"></label>
+    <label class="f">出発地（営業所など）<input type="text" id="sStart" value="${h(s.start)}" placeholder="住所を入力" autocomplete="off"></label>
+    <div class="sg" id="sStartBox"></div>
     <label class="f"><input type="checkbox" id="sSame" ${s.sameEnd ? 'checked' : ''}> 出発地に戻る</label>
-    <label class="f" id="endWrap" ${s.sameEnd ? 'hidden' : ''}>帰着地（空なら最後の配達先で終了）<input type="text" id="sEnd" value="${h(s.end)}"></label>
+    <div id="endWrap" ${s.sameEnd ? 'hidden' : ''}>
+      <label class="f">帰着地（空なら最後の配達先で終了）<input type="text" id="sEnd" value="${h(s.end)}" autocomplete="off"></label>
+      <div class="sg" id="sEndBox"></div>
+    </div>
     <label class="f">1区間に入れる経由地の数
       <select id="sWp"><option value="9" ${s.maxWp == 9 ? 'selected' : ''}>9件（アプリで開く場合）</option><option value="3" ${s.maxWp == 3 ? 'selected' : ''}>3件（スマホのブラウザで開く場合）</option></select></label>
     <h2>セキュリティ</h2>
@@ -572,6 +725,8 @@ function renderSet() {
     <button class="danger" data-act="wipe">この端末のデータをすべて消す</button>`;
   const saveS = () => { s.start = sStart.value.trim(); s.sameEnd = sSame.checked; s.end = sEnd.value.trim(); s.maxWp = +sWp.value; s.autoLockMin = +sLock.value; routeState = null; save(); endWrap.hidden = s.sameEnd; };
   [sStart, sSame, sEnd, sWp, sLock].forEach(el => el.onchange = saveS);
+  attachSuggest(sStart, sStartBox, saveS);
+  attachSuggest(sEnd, sEndBox, saveS);
 }
 function changePinDialog() {
   dlgForm.innerHTML = `
@@ -662,7 +817,7 @@ function showGate(mode) {
 function lock() {
   if (!cryptoKey) return;
   lockSession++;
-  cryptoKey = null; keyMeta = null; db = blank(); routeState = null; busy = ''; query = '';
+  cryptoKey = null; keyMeta = null; db = blank(); routeState = null; busy = ''; query = ''; issues = null; checking = '';
   if (dlg.open) dlg.close('cancel');
   view.innerHTML = '';
   showGate('unlock');
@@ -704,6 +859,8 @@ view.addEventListener('click', e => {
   const d = b.dataset;
   if (d.go) show(d.go);
   if (d.edit) editDialog(byId(d.edit));
+  if (d.fix) fixAddress(d.fix);
+  if (d.act === 'checkAll') checkAll();
   if (d.up) moveStop(+d.up, -1);
   if (d.down) moveStop(+d.down, 1);
   if (d.act === 'add') editDialog();
