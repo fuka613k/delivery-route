@@ -63,6 +63,9 @@ body:not(.locked) #gate{display:none}
 #gate button{width:100%;margin-top:12px}
 #gate button.link{border:0;background:none;color:var(--sub);text-decoration:underline}
 .err{color:var(--bad);min-height:1.5em;font-size:14px;margin:8px 0 0}
+.pin{min-height:32px;padding:2px 8px;margin-top:4px;font-size:13px;color:var(--sub)}
+.pin.on{background:var(--warn-bg);border-color:#ecd2a2;color:var(--warn);font-weight:700}
+.save{font-size:20px;font-weight:700}
 .ng{color:var(--bad);font-size:14px;font-weight:700;display:block;overflow-wrap:anywhere}
 </style>
 </head>
@@ -213,6 +216,89 @@ function checkMessage(c) {
   return k.status === 'none' ? 'Googleで見つかりません' : `一部だけ一致（Googleの認識：${k.google}）`;
 }
 const checkNote = c => { const m = checkMessage(c); return m ? `<span class="ng">⚠ ${h(m)}</span>` : ''; };
+/* ========== Googleの所要時間で順番を提案（ボタンを押したときだけ動く） ========== */
+let proposal = null, proposing = false;
+const MIN_SAVE_SEC = 60;                          // これ未満の短縮は提案しない
+const waypoint = c => c.manualPos && hasPos(c) ? { location: { latLng: { latitude: c.lat, longitude: c.lng } } } : { address: c.address };
+async function computeRoute(origin, destination, stops, optimize) {
+  const body = { origin, destination, intermediates: stops.map(waypoint), travelMode: 'DRIVE', routingPreference: 'TRAFFIC_UNAWARE', languageCode: 'ja', regionCode: 'JP' };
+  if (optimize) body.optimizeWaypointOrder = true;
+  const r = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': db.settings.mapsKey, 'X-Goog-FieldMask': 'routes.duration,routes.optimizedIntermediateWaypointIndex' },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    throw new Error({ 400: '計算できない住所があります。住所を確認してください', 403: 'Routes APIの有効化とAPIキーの制限を確認してください', 429: '利用回数の上限に達しました' }[r.status] || `Googleから応答がありませんでした（${r.status}）`);
+  }
+  const route = ((await r.json()).routes || [])[0];
+  if (!route) throw new Error('経路を見つけられない住所があります。住所を確認してください');
+  return { sec: parseInt(route.duration, 10) || 0, order: route.optimizedIntermediateWaypointIndex || null };
+}
+function routeSections(stops, start, end) {       // 固定した家の間ごとに区切る（1回の計算は経由地25件まで）
+  const sections = [], n = stops.length;
+  let from = start ? { address: start } : null, free = [];
+  const push = to => {
+    while (free.length > 25) {
+      const next = free[25];
+      sections.push({ from, to: waypoint(next), free: free.slice(0, 25) });
+      from = waypoint(next); free = free.slice(26);
+    }
+    sections.push({ from, to, free });
+    free = [];
+  };
+  stops.forEach((c, i) => {
+    if (!from) { from = waypoint(c); return; }
+    if (c.pinned || (i === n - 1 && !end)) { push(waypoint(c)); from = waypoint(c); } else free.push(c);
+  });
+  if (end && free.length) push({ address: end });
+  return sections.filter(x => x.free.length >= 2);
+}
+async function proposeOrder() {
+  const sess = lockSession, ids = routeIds(), stops = ids.map(byId), s = db.settings, end = s.sameEnd ? s.start : s.end;
+  const sections = routeSections(stops, s.start, end);
+  if (!sections.length) { proposal = { key: ids.join(), order: ids, before: 0, after: 0 }; renderRoute(); return; }
+  proposing = true; proposal = null; renderRoute();
+  try {
+    const order = ids.slice();
+    let before = 0, after = 0;
+    for (const x of sections) {
+      const now = await computeRoute(x.from, x.to, x.free, false);
+      const best = await computeRoute(x.from, x.to, x.free, true);
+      if (sess !== lockSession) return;
+      const better = best.order && best.order.length === x.free.length && best.sec < now.sec;
+      before += now.sec; after += better ? best.sec : now.sec;
+      if (better) {
+        const places = x.free.map(c => order.indexOf(c.id)).sort((a, b) => a - b);
+        best.order.forEach((from, i) => { order[places[i]] = x.free[from].id; });
+      }
+    }
+    proposal = { key: ids.join(), order, before, after };
+  } catch (e) {
+    if (sess !== lockSession) return;
+    alert('提案を計算できませんでした：' + e.message);
+  }
+  proposing = false;
+  if (tab === 'route') renderRoute();
+}
+function proposalHtml(ids) {
+  if (proposing) return '<div class="card">Googleで所要時間を計算しています…</div>';
+  const p = proposal && proposal.key === ids.join() ? proposal : null;
+  if (!p) return db.settings.mapsKey && ids.length >= 2 ? '<div class="row-line"><button data-act="propose">Googleで所要時間の短い順を提案</button></div>' : '';
+  const saved = p.before - p.after;
+  if (saved < MIN_SAVE_SEC || p.order.every((id, i) => id === ids[i])) {
+    return `<div class="card">今の順番で問題ありません。これより明らかに早い順番は見つかりませんでした。<div class="row-line"><button data-act="clearProposal">閉じる</button></div></div>`;
+  }
+  const min = sec => Math.round(sec / 60);
+  return `<div class="card">
+    <h3>もっと早い順番があります</h3>
+    <div class="save">約${Math.max(1, min(saved))}分 短縮</div>
+    <p class="muted">入れ替えた区間の移動時間：約${min(p.before)}分 → 約${min(p.after)}分（渋滞や配達先での時間は含みません）</p>
+    <ol>${p.order.map(id => `<li>${h(label(byId(id)))}${byId(id).pinned ? '（固定）' : ''}</li>`).join('')}</ol>
+    <div class="row-line"><button class="primary" data-act="useProposal">この順番にする</button><button data-act="clearProposal">今の順番のまま</button></div>
+  </div>`;
+}
+
 async function checkOne(c) {                      // 登録・変更した1件を確認し、問題があれば知らせる
   const sess = lockSession;
   try {
@@ -258,18 +344,18 @@ function parseCsv(text) {
 function toCustomers(rows) {
   if (!rows.length) return [];
   const width = rows[0].length;
-  let col = width >= 3 ? { no: 0, name: 1, address: 2, lat: 3, lng: 4, manual: 5 }
-    : width === 2 ? { no: 0, name: -1, address: 1, lat: -1, lng: -1, manual: -1 }
-      : { no: -1, name: -1, address: 0, lat: -1, lng: -1, manual: -1 };
+  let col = width >= 3 ? { no: 0, name: 1, address: 2, lat: 3, lng: 4, manual: 5, pin: 6 }
+    : width === 2 ? { no: 0, name: -1, address: 1, lat: -1, lng: -1, manual: -1, pin: -1 }
+      : { no: -1, name: -1, address: 0, lat: -1, lng: -1, manual: -1, pin: -1 };
   const head = rows[0].map(c => c.replace(/^\uFEFF/, ''));
   if (head.some(c => c.includes('住所'))) {
     const f = re => head.findIndex(c => re.test(c));
-    col = { no: f(/番号|順番|No/i), name: f(/名前|氏名/), address: f(/住所/), lat: f(/緯度/), lng: f(/経度/), manual: f(/位置指定/) };
+    col = { no: f(/番号|順番|No/i), name: f(/名前|氏名/), address: f(/住所/), lat: f(/緯度/), lng: f(/経度/), manual: f(/位置指定/), pin: f(/時間指定|固定/) };
     rows = rows.slice(1);
   }
   const list = rows.map((r, i) => {
     const lat = parseFloat(r[col.lat]), lng = parseFloat(r[col.lng]), manual = r[col.manual] === '1' && Number.isFinite(lat) && Number.isFinite(lng);
-    return { id: uid() + i, name: col.name >= 0 ? (r[col.name] || '') : '', address: r[col.address] || '', lat: manual ? lat : null, lng: manual ? lng : null, manualPos: manual, rank: parseInt(z2h(r[col.no] ?? ''), 10) };
+    return { id: uid() + i, name: col.name >= 0 ? (r[col.name] || '') : '', address: r[col.address] || '', lat: manual ? lat : null, lng: manual ? lng : null, manualPos: manual, pinned: r[col.pin] === '1', rank: parseInt(z2h(r[col.no] ?? ''), 10) };
   }).filter(c => c.address);
   if (list.every(c => Number.isFinite(c.rank))) list.sort((a, b) => a.rank - b.rank);   // 順番の列があればその順に並べる
   list.forEach(c => delete c.rank);
@@ -282,7 +368,7 @@ function decodeFile(buf) {
 function exportCsv() {
   if (!confirm('CSVファイルは暗号化されず、名前と住所をそのまま読めます。保存しますか？\n保存先は安全な場所1か所にし、不要になったファイルは消してください。')) return;
   const q = v => /[",\n]/.test(String(v ?? '')) ? `"${String(v).replace(/"/g, '""')}"` : (v ?? '');
-  const lines = [['順番', '名前', '住所', '緯度', '経度', '位置指定'], ...db.customers.map((c, i) => c.manualPos ? [i + 1, c.name, c.address, c.lat, c.lng, 1] : [i + 1, c.name, c.address, '', '', ''])].map(r => r.map(q).join(','));
+  const lines = [['順番', '名前', '住所', '緯度', '経度', '位置指定', '時間指定'], ...db.customers.map((c, i) => c.manualPos ? [i + 1, c.name, c.address, c.lat, c.lng, 1, c.pinned ? 1 : ''] : [i + 1, c.name, c.address, '', '', '', c.pinned ? 1 : ''])].map(r => r.map(q).join(','));
   const url = URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' }));
   const a = Object.assign(document.createElement('a'), { href: url, download: `顧客リスト_${dateStr()}.csv` });
   a.click(); URL.revokeObjectURL(url);
@@ -367,13 +453,15 @@ function renderRoute() {
       <a class="primary" href="${h(l.url)}" target="_blank" rel="noopener noreferrer">${links.length > 1 ? `区間${i + 1}：` : ''}${l.homeOnly ? '帰着地まで' : `${l.from}〜${l.to}軒目`}をGoogleマップで開く</a>`).join('')}
       ${links.length > 1 ? `<p class="muted">Googleマップの上限のため${links.length}区間に分かれています。区間を走り終えたら次のボタンを押してください。</p>` : ''}
     </div>
+    ${proposalHtml(stops.map(c => c.id))}
     ${db.today.manual ? '<div class="card"><b>今日だけ順番を入れ替え中</b><div class="row-line"><button data-act="useBase">いつもの順に戻す</button></div></div>' : ''}
     <p class="muted">≡ を押したまま上下に動かすと、順番を入れ替えられます。</p>
     <div class="card" id="stopRows" data-list="route">${stops.map((c, i) => `
       <div class="stop dragitem">
         <span class="drag" aria-label="ドラッグして移動">≡</span>
         <span class="idx">${i + 1}</span>
-        <span class="grow"><b>${h(label(c))}</b>${c.name ? `<br><span class="addr">${h(c.address)}</span>` : ''}${checkNote(c)}</span>
+        <span class="grow"><b>${h(label(c))}</b>${c.name ? `<br><span class="addr">${h(c.address)}</span>` : ''}${checkNote(c)}
+          <button class="pin ${c.pinned ? 'on' : ''}" data-pin="${h(c.id)}">${c.pinned ? '📌 順番を固定中' : '順番を固定'}</button></span>
         <button class="mv" data-up="${i}" ${i ? '' : 'disabled'} aria-label="上へ">↑</button>
         <button class="mv" data-down="${i}" ${i < stops.length - 1 ? '' : 'disabled'} aria-label="下へ">↓</button>
       </div>`).join('')}</div>`;
@@ -413,6 +501,7 @@ function editDialog(c) {
     <label class="f">配達の順番（選んだ人の次に入ります）
       <select id="fAfter"><option value="">一番最初</option>${others.map((x, i) => `<option value="${h(x.id)}" ${x.id === afterId ? 'selected' : ''}>${i + 1}. ${h(label(x))} の次</option>`).join('')}</select></label>
     <p class="muted" id="fBetween"></p>
+    <label class="f"><input type="checkbox" id="fPin" ${c.pinned ? 'checked' : ''}> 時間指定あり（提案で順番を動かさない）</label>
     <label class="f">緯度, 経度（Googleマップで住所が出ないときだけ。地点を長押しすると表示されます。入れると地図はこの地点を案内します）
       <input type="text" id="fPos" value="${h(c.manualPos ? coords : '')}" placeholder="例: 34.6938, 135.5012"></label>
     <div class="row-line"><button class="primary" value="ok">保存</button><button value="cancel" formnovalidate>やめる</button>${isNew ? '' : '<button class="danger" value="del">削除</button>'}</div>`;
@@ -433,7 +522,7 @@ function editDialog(c) {
       const m = fPos.value.match(/(-?\d+(?:\.\d+)?)\s*[,、\s]\s*(-?\d+(?:\.\d+)?)/);
       const posText = fPos.value.trim();
       if (posText && !m) { alert('緯度, 経度の形式が読み取れないため、位置は保存しませんでした'); }
-      Object.assign(c, { name: fName.value.trim(), address });
+      Object.assign(c, { name: fName.value.trim(), address, pinned: fPin.checked });
       Object.assign(c, m ? { lat: +m[1], lng: +m[2], manualPos: true } : { lat: null, lng: null, manualPos: false });
       const rest = others.slice(), at = fAfter.value ? rest.findIndex(x => x.id === fAfter.value) + 1 : 0;
       rest.splice(at, 0, c);
@@ -475,8 +564,8 @@ function renderSet() {
     <label class="f" id="endWrap" ${s.sameEnd ? 'hidden' : ''}>帰着地（空なら最後の配達先で終了）<input type="text" id="sEnd" value="${h(s.end)}"></label>
     <label class="f">1区間に入れる経由地の数
       <select id="sWp"><option value="9" ${s.maxWp == 9 ? 'selected' : ''}>9件（アプリで開く場合）</option><option value="3" ${s.maxWp == 3 ? 'selected' : ''}>3件（スマホのブラウザで開く場合）</option></select></label>
-    <h2>Googleの住所チェック</h2>
-    <label class="f">Google APIキー（空なら住所チェックはしません）
+    <h2>Googleの住所チェックと所要時間の提案</h2>
+    <label class="f">Google APIキー（空なら使いません）
       <input type="password" id="sKey" value="${h(s.mapsKey)}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></label>
     <p class="muted">キーはこの端末にPINで暗号化して保存され、公開サイトには含まれません。</p>
     <h2>セキュリティ</h2>
@@ -486,7 +575,7 @@ function renderSet() {
     <h2>個人情報の扱い</h2>
     <div class="card muted">
       顧客データと設定は、この端末のブラウザ内にPINで暗号化して保存されます。<br>
-      住所は地図表示と住所チェックのためGoogleへ送られます。名前は送信しません。APIキーを設定すると、住所チェックのときにGoogleのプログラムを読み込みます。<br>
+      住所は地図表示、住所チェック、所要時間の計算のためGoogleへ送られます。名前は送信しません。APIキーを設定すると、住所チェックのときにGoogleのプログラムを読み込みます。<br>
       ブラウザのデータを消すとリストも消え、PINを忘れると元に戻せません。顧客画面の「CSVに保存」で控えを1つ、安全な場所に保管してください。
     </div>
     <h2>データ</h2>
@@ -593,14 +682,14 @@ function showGate(mode) {
 function lock() {
   if (!cryptoKey) return;
   lockSession++;
-  cryptoKey = null; keyMeta = null; db = blank(); query = ''; gChecking = '';
+  cryptoKey = null; keyMeta = null; db = blank(); query = ''; gChecking = ''; proposal = null; proposing = false;
   if (dlg.open) dlg.close('cancel');
   view.innerHTML = '';
   showGate('unlock');
 }
 function wipeAll() {
   lockSession++;
-  cryptoKey = null; keyMeta = null; db = blank(); query = ''; gChecking = ''; view.innerHTML = '';
+  cryptoKey = null; keyMeta = null; db = blank(); query = ''; gChecking = ''; proposal = null; proposing = false; view.innerHTML = '';
   [KEY_ENC, KEY_FAIL, KEY_V1].forEach(k => localStorage.removeItem(k));
   showGate('setup');
 }
@@ -642,6 +731,10 @@ view.addEventListener('click', e => {
   if (d.act === 'export') exportCsv();
   if (d.act === 'useBase') { db.today.order = null; db.today.manual = false; save(); renderRoute(); }
   if (d.act === 'gCheck') checkUnchecked();
+  if (d.act === 'propose') proposeOrder();
+  if (d.act === 'clearProposal') { proposal = null; renderRoute(); }
+  if (d.act === 'useProposal') { const o = proposal.order; proposal = null; setRoute(o); window.scrollTo(0, 0); }
+  if (d.pin) { const c = byId(d.pin); c.pinned = !c.pinned; proposal = null; save(); renderRoute(); }
   if (d.act === 'lockNow') lock();
   if (d.act === 'changePin') changePinDialog();
   if (d.act === 'wipe' && confirm('顧客リストと設定をすべて消します。よろしいですか？')) wipeAll();
