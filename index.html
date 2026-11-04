@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer">
+<meta name="referrer" content="strict-origin">
 <title>配達ルート</title>
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
@@ -63,6 +63,7 @@ body:not(.locked) #gate{display:none}
 #gate button{width:100%;margin-top:12px}
 #gate button.link{border:0;background:none;color:var(--sub);text-decoration:underline}
 .err{color:var(--bad);min-height:1.5em;font-size:14px;margin:8px 0 0}
+.ng{color:var(--bad);font-size:14px;font-weight:700;display:block;overflow-wrap:anywhere}
 </style>
 </head>
 <body class="locked">
@@ -88,7 +89,7 @@ const MAX_URL = 2000;                            // Googleの上限2048文字に
 
 const blank = () => ({
   customers: [],
-  settings: { start: '', end: '', sameEnd: true, maxWp: 9, autoLockMin: 15 },
+  settings: { start: '', end: '', sameEnd: true, maxWp: 9, autoLockMin: 15, mapsKey: '' },
   today: { date: '', checked: [], order: null, manual: false }
 });
 const withDefaults = d => ({ ...blank(), ...d, settings: { ...blank().settings, ...d.settings } });
@@ -171,6 +172,73 @@ function buildLinks(addresses, start, end, maxWp) {  // 上限を超えないよ
 }
 
 const z2h = s => String(s).replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0));
+
+/* ========== Googleの住所チェック（APIキーを設定したときだけ動く。送るのは住所のみ） ========== */
+let geocoderReady = null, gChecking = '', gmAuthFailed = false;
+window.gm_authFailure = () => { gmAuthFailed = true; };
+function loadGeocoder() {
+  if (geocoderReady) return geocoderReady;
+  geocoderReady = new Promise((resolve, reject) => {
+    window.gmReady = () => resolve(new google.maps.Geocoder());
+    const el = document.createElement('script');
+    el.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(db.settings.mapsKey) + '&language=ja&region=JP&v=weekly&libraries=geocoding&loading=async&callback=gmReady';
+    el.async = true;
+    el.onerror = () => { geocoderReady = null; reject(new Error('Googleに接続できませんでした')); };
+    document.head.appendChild(el);
+  });
+  return geocoderReady;
+}
+function gcheckError(code) {
+  return { REQUEST_DENIED: 'APIキーの設定を確認してください', OVER_QUERY_LIMIT: '利用回数の上限に達しました', OVER_DAILY_LIMIT: '利用回数の上限に達しました' }[code] || `Googleから応答がありませんでした（${code || '通信エラー'}）`;
+}
+async function checkAddress(address) {            // none:見つからない partial:要確認 ok:問題なし
+  const geocoder = await loadGeocoder();
+  let results = [];
+  try {
+    results = (await geocoder.geocode({ address, region: 'JP' })).results || [];
+  } catch (e) {
+    if (e && e.code !== 'ZERO_RESULTS') throw new Error(gcheckError(e.code));
+  }
+  if (gmAuthFailed) throw new Error(gcheckError('REQUEST_DENIED'));
+  const r = results[0];
+  if (!r) return { for: address, status: 'none', google: '' };
+  const rough = r.partial_match || (r.geometry && r.geometry.location_type === 'APPROXIMATE');
+  return { for: address, status: rough ? 'partial' : 'ok', google: r.formatted_address || '' };
+}
+const checkOf = c => (c.check && c.check.for === c.address ? c.check : null);
+const needsCheck = c => !!db.settings.mapsKey && !c.manualPos && !checkOf(c);
+function checkMessage(c) {
+  const k = checkOf(c);
+  if (!k || c.manualPos || k.status === 'ok') return '';
+  return k.status === 'none' ? 'Googleで見つかりません' : `一部だけ一致（Googleの認識：${k.google}）`;
+}
+const checkNote = c => { const m = checkMessage(c); return m ? `<span class="ng">⚠ ${h(m)}</span>` : ''; };
+async function checkOne(c) {                      // 登録・変更した1件を確認し、問題があれば知らせる
+  const sess = lockSession;
+  try {
+    const k = await checkAddress(c.address);
+    if (sess !== lockSession) return;
+    c.check = k; save(); render();
+    if (k.status !== 'ok') alert(`${label(c)}\n${checkMessage(c)}`);
+  } catch (e) { if (sess === lockSession) alert('住所チェックができませんでした：' + e.message); }
+}
+async function checkUnchecked() {                 // 未確認の住所をまとめて確認する
+  const sess = lockSession, list = db.customers.filter(needsCheck);
+  for (let i = 0; i < list.length; i++) {
+    if (sess !== lockSession) return;
+    gChecking = `確認中 ${i + 1}/${list.length}`; if (tab === 'list') renderList();
+    try {
+      const k = await checkAddress(list[i].address);
+      if (sess !== lockSession) return;
+      list[i].check = k; save();
+    } catch (e) { gChecking = ''; renderList(); alert('住所チェックを止めました：' + e.message); return; }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  gChecking = '';
+  if (tab === 'list') renderList();
+  const ng = db.customers.filter(c => checkMessage(c)).length;
+  alert(ng ? `確認が必要な住所が${ng}件あります。顧客リストの赤い表示を確認してください。` : '確認した住所に問題は見つかりませんでした。');
+}
 
 /* ========== CSV ========== */
 function parseCsv(text) {
@@ -290,7 +358,9 @@ function renderRoute() {
     return;
   }
   const links = buildLinks(stops.map(c => c.manualPos && hasPos(c) ? `${c.lat},${c.lng}` : c.address), s.start, end, s.maxWp);
+  const ng = stops.filter(c => checkMessage(c));
   view.innerHTML = `
+    ${ng.length ? `<div class="card warn"><b>地図に正しく出ない可能性がある住所（${ng.length}件）</b><ul>${ng.map(c => `<li>${h(label(c))}：${h(checkMessage(c))}</li>`).join('')}</ul></div>` : ''}
     ${s.start ? '' : '<div class="card warn">出発地が未設定なので、地図は現在地から始まります。<button data-go="set">設定する</button></div>'}
     <h2>今日のルート（${stops.length}件）</h2>
     <div class="card">${links.map((l, i) => `
@@ -303,7 +373,7 @@ function renderRoute() {
       <div class="stop dragitem">
         <span class="drag" aria-label="ドラッグして移動">≡</span>
         <span class="idx">${i + 1}</span>
-        <span class="grow"><b>${h(label(c))}</b>${c.name ? `<br><span class="addr">${h(c.address)}</span>` : ''}</span>
+        <span class="grow"><b>${h(label(c))}</b>${c.name ? `<br><span class="addr">${h(c.address)}</span>` : ''}${checkNote(c)}</span>
         <button class="mv" data-up="${i}" ${i ? '' : 'disabled'} aria-label="上へ">↑</button>
         <button class="mv" data-down="${i}" ${i < stops.length - 1 ? '' : 'disabled'} aria-label="下へ">↓</button>
       </div>`).join('')}</div>`;
@@ -319,14 +389,15 @@ function applyDrag(list, from, to) {
   else { db.customers = moved(db.customers, from, to); save(); renderList(); }
 }
 function renderList() {
+  const unchecked = db.customers.filter(needsCheck).length;
   view.innerHTML = `
     <p class="muted">上から順が「いつもの順」です。≡ を押したまま動かすか、番号を書き換えると並べ替えられます。</p>
-    <div class="row-line"><button class="primary" data-act="add">＋ 顧客を追加</button><button data-act="import">まとめて登録</button><button data-act="export" ${db.customers.length ? '' : 'disabled'}>CSVに保存</button></div>
+    <div class="row-line"><button class="primary" data-act="add">＋ 顧客を追加</button><button data-act="import">まとめて登録</button>${db.settings.mapsKey ? `<button data-act="gCheck" ${gChecking || !unchecked ? 'disabled' : ''}>${gChecking ? h(gChecking) : `Googleで住所チェック（未確認${unchecked}件）`}</button>` : ''}<button data-act="export" ${db.customers.length ? '' : 'disabled'}>CSVに保存</button></div>
     <div id="custRows" data-list="customers">${db.customers.map((c, i) => `
       <div class="cust dragitem" style="cursor:default">
         <span class="drag" aria-label="ドラッグして移動">≡</span>
         <input class="pos" type="number" min="1" max="${db.customers.length}" value="${i + 1}" data-pos="${i}" aria-label="順番">
-        <span class="grow"><b>${h(label(c))}</b>${c.name ? `<br><span class="addr">${h(c.address)}</span>` : ''}</span>
+        <span class="grow"><b>${h(label(c))}</b>${c.name ? `<br><span class="addr">${h(c.address)}</span>` : ''}${checkNote(c)}</span>
         <button data-edit="${h(c.id)}">編集</button>
       </div>`).join('') || '<div class="empty">まだ登録がありません</div>'}</div>`;
 }
@@ -368,6 +439,7 @@ function editDialog(c) {
       rest.splice(at, 0, c);
       db.customers = rest;
       save();
+      if (needsCheck(c)) checkOne(c);
     } else return;
     render();
   };
@@ -403,6 +475,10 @@ function renderSet() {
     <label class="f" id="endWrap" ${s.sameEnd ? 'hidden' : ''}>帰着地（空なら最後の配達先で終了）<input type="text" id="sEnd" value="${h(s.end)}"></label>
     <label class="f">1区間に入れる経由地の数
       <select id="sWp"><option value="9" ${s.maxWp == 9 ? 'selected' : ''}>9件（アプリで開く場合）</option><option value="3" ${s.maxWp == 3 ? 'selected' : ''}>3件（スマホのブラウザで開く場合）</option></select></label>
+    <h2>Googleの住所チェック</h2>
+    <label class="f">Google APIキー（空なら住所チェックはしません）
+      <input type="password" id="sKey" value="${h(s.mapsKey)}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></label>
+    <p class="muted">キーはこの端末にPINで暗号化して保存され、公開サイトには含まれません。</p>
     <h2>セキュリティ</h2>
     <label class="f">操作しないとロックするまでの時間
       <select id="sLock">${[5, 15, 30, 60].map(m => `<option value="${m}" ${s.autoLockMin == m ? 'selected' : ''}>${m}分</option>`).join('')}</select></label>
@@ -410,13 +486,16 @@ function renderSet() {
     <h2>個人情報の扱い</h2>
     <div class="card muted">
       顧客データと設定は、この端末のブラウザ内にPINで暗号化して保存されます。<br>
-      住所は地図表示のためGoogleへ送られます。名前は送信しません。<br>
+      住所は地図表示と住所チェックのためGoogleへ送られます。名前は送信しません。APIキーを設定すると、住所チェックのときにGoogleのプログラムを読み込みます。<br>
       ブラウザのデータを消すとリストも消え、PINを忘れると元に戻せません。顧客画面の「CSVに保存」で控えを1つ、安全な場所に保管してください。
     </div>
     <h2>データ</h2>
     <button class="danger" data-act="wipe">この端末のデータをすべて消す</button>`;
-  const saveS = () => { s.start = sStart.value.trim(); s.sameEnd = sSame.checked; s.end = sEnd.value.trim(); s.maxWp = +sWp.value; s.autoLockMin = +sLock.value; save(); endWrap.hidden = s.sameEnd; };
-  [sStart, sSame, sEnd, sWp, sLock].forEach(el => el.onchange = saveS);
+  const saveS = () => { s.start = sStart.value.trim(); s.sameEnd = sSame.checked; s.end = sEnd.value.trim(); s.maxWp = +sWp.value; s.autoLockMin = +sLock.value;
+    const key = sKey.value.trim(), keyChanged = key !== s.mapsKey;
+    s.mapsKey = key; save();
+    if (keyChanged && geocoderReady) alert('新しいキーを使うには、ページを読み込み直してください'); endWrap.hidden = s.sameEnd; };
+  [sStart, sSame, sEnd, sWp, sLock, sKey].forEach(el => el.onchange = saveS);
 }
 function changePinDialog() {
   dlgForm.innerHTML = `
@@ -514,14 +593,14 @@ function showGate(mode) {
 function lock() {
   if (!cryptoKey) return;
   lockSession++;
-  cryptoKey = null; keyMeta = null; db = blank(); query = '';
+  cryptoKey = null; keyMeta = null; db = blank(); query = ''; gChecking = '';
   if (dlg.open) dlg.close('cancel');
   view.innerHTML = '';
   showGate('unlock');
 }
 function wipeAll() {
   lockSession++;
-  cryptoKey = null; keyMeta = null; db = blank(); query = ''; view.innerHTML = '';
+  cryptoKey = null; keyMeta = null; db = blank(); query = ''; gChecking = ''; view.innerHTML = '';
   [KEY_ENC, KEY_FAIL, KEY_V1].forEach(k => localStorage.removeItem(k));
   showGate('setup');
 }
@@ -562,6 +641,7 @@ view.addEventListener('click', e => {
   if (d.act === 'import') importDialog();
   if (d.act === 'export') exportCsv();
   if (d.act === 'useBase') { db.today.order = null; db.today.manual = false; save(); renderRoute(); }
+  if (d.act === 'gCheck') checkUnchecked();
   if (d.act === 'lockNow') lock();
   if (d.act === 'changePin') changePinDialog();
   if (d.act === 'wipe' && confirm('顧客リストと設定をすべて消します。よろしいですか？')) wipeAll();
