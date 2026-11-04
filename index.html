@@ -218,7 +218,7 @@ function checkMessage(c) {
 const checkNote = c => { const m = checkMessage(c); return m ? `<span class="ng">⚠ ${h(m)}</span>` : ''; };
 /* ========== Googleの所要時間で順番を提案（ボタンを押したときだけ動く） ========== */
 let proposal = null, proposing = false;
-const MIN_SAVE_SEC = 60;                          // これ未満の短縮は提案しない
+const MIN_SAVE_SEC = 600;                         // 10分未満の短縮は提案しない
 const waypoint = c => c.manualPos && hasPos(c) ? { location: { latLng: { latitude: c.lat, longitude: c.lng } } } : { address: c.address };
 async function computeRoute(origin, destination, stops, optimize) {
   const body = { origin, destination, intermediates: stops.map(waypoint), travelMode: 'DRIVE', routingPreference: 'TRAFFIC_UNAWARE', languageCode: 'ja', regionCode: 'JP' };
@@ -287,7 +287,7 @@ function proposalHtml(ids) {
   if (!p) return db.settings.mapsKey && ids.length >= 2 ? '<div class="row-line"><button data-act="propose">Googleで所要時間の短い順を提案</button></div>' : '';
   const saved = p.before - p.after;
   if (saved < MIN_SAVE_SEC || p.order.every((id, i) => id === ids[i])) {
-    return `<div class="card">今の順番で問題ありません。これより明らかに早い順番は見つかりませんでした。<div class="row-line"><button data-act="clearProposal">閉じる</button></div></div>`;
+    return `<div class="card">今の順番で問題ありません。10分以上早くなる順番は見つかりませんでした。<div class="row-line"><button data-act="clearProposal">閉じる</button></div></div>`;
   }
   const min = sec => Math.round(sec / 60);
   return `<div class="card">
